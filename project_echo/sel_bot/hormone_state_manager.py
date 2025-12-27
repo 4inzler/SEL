@@ -93,8 +93,14 @@ class HormoneStateManager:
         self._him_available = True
         if store is None:
             try:
+                root_path = Path(him_root)
+                if root_path.is_absolute():
+                    if root_path.parts[:2] == ("/", "nonexistent"):
+                        raise FileNotFoundError(f"HIM root does not exist: {root_path}")
+                    if not root_path.exists():
+                        raise FileNotFoundError(f"HIM root does not exist: {root_path}")
                 from him import HierarchicalImageMemory
-                self.store = HierarchicalImageMemory(Path(him_root))
+                self.store = HierarchicalImageMemory(root_path)
             except Exception as exc:
                 logger.warning("Failed to initialize HIM storage: %s - running in cache-only mode", exc)
                 self.store = None
