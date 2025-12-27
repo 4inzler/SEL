@@ -161,6 +161,62 @@ def _extract_topic_keywords(recent_msgs: list[str]) -> list[str]:
     return [word for word, _ in counts.most_common(3)]
 
 
+def _add_human_touches(reply: str, hormones: HormoneVector) -> str:
+    """
+    Add extremely subtle human imperfections that make text feel naturally typed.
+    
+    Focus on natural artifacts like:
+    - Missed autocorrect (thats -> that's sometimes not happening)
+    - Natural punctuation variation
+    
+    Keep it VERY subtle - authenticity comes from the voice, not manufactured errors.
+    Most of the time, this does nothing. That's intentional.
+    """
+    import random
+    
+    # Don't mess with code blocks or very short messages
+    if "```" in reply or len(reply) < 30:
+        return reply
+    
+    # Only apply touches rarely and when hormones suggest fast/distracted typing
+    energy_factor = hormones.adrenaline * 0.3 + hormones.dopamine * 0.2
+    distraction_factor = hormones.cortisol * 0.2 + hormones.melatonin * 0.15
+    
+    # Very low base chance - we want this to be rare
+    touch_chance = max(0.0, min(0.05, energy_factor + distraction_factor))
+    
+    if random.random() > touch_chance:
+        return reply
+    
+    # If we get here, maybe drop an apostrophe from a contraction (common typing shortcut)
+    # But only do this once per message maximum
+    contractions = {
+        "it's": "its",
+        "that's": "thats", 
+        "there's": "theres",
+        "what's": "whats",
+        "you're": "youre",
+        "they're": "theyre",
+        "don't": "dont",
+        "can't": "cant",
+        "won't": "wont",
+        "isn't": "isnt",
+        "wasn't": "wasnt",
+        "hasn't": "hasnt",
+        "haven't": "havent",
+        "wouldn't": "wouldnt",
+        "couldn't": "couldnt",
+        "shouldn't": "shouldnt"
+    }
+    
+    for proper, casual in contractions.items():
+        if proper in reply and random.random() < 0.3:  # Only 30% chance even if we found one
+            reply = reply.replace(proper, casual, 1)  # Only first occurrence
+            break  # Only one touch per message
+    
+    return reply
+
+
 def _adjust_repeated_opener(reply: str, recent_openers: list[str]) -> str:
     if not reply or not recent_openers:
         return reply
@@ -1045,6 +1101,7 @@ class SelDiscordClient(discord.Client):
                 "I'm still reading—try again in a moment."
             )
         reply = _adjust_repeated_opener(reply, recent_sel_openers)
+        reply = _add_human_touches(reply, hormones)
         latency_ms = int((time.perf_counter() - start) * 1000)
         reply_text = (reply or "").strip() or "(no response)"
         # Typing indicator and human-ish delay
