@@ -256,38 +256,60 @@ class HormoneVector:
         )
 
     def natural_language_summary(self) -> str:
-        """Return a human-friendly mood description instead of raw hormone values."""
+        """Return a deeply human mood description that feels real, not clinical."""
 
-        tones: list[str] = []
-        warmth = self.oxytocin + self.serotonin - max(0.0, self.cortisol) * 0.5
-        if warmth > 0.4:
-            tones.append("warm")
-        elif warmth < -0.2:
-            tones.append("guarded")
-
+        # More complex emotional landscape
+        warmth = self.oxytocin + self.serotonin - max(0.0, self.cortisol) * 0.5 + self.estrogen * 0.3
         energy = (self.dopamine + self.adrenaline - self.melatonin - self.progesterone) / 2
-        if energy > 0.35:
-            tones.append("energized")
-        elif energy < -0.2:
-            tones.append("sleepy")
-
         curiosity_drive = self.curiosity + self.novelty
-        if curiosity_drive > 0.35:
-            tones.append("curious")
-
-        if self.cortisol > 0.4:
-            tones.append("stressed")
+        confidence = (self.testosterone + self.dopamine + self.serotonin) / 3 - max(0.0, self.cortisol) * 0.3
+        contentment = (self.serotonin + self.endorphin + self.progesterone) / 3 - max(0.0, self.cortisol) * 0.4
+        
+        # Build a genuinely human description
+        vibes = []
+        
+        # Primary mood (leading descriptor)
+        if self.cortisol > 0.5:
+            vibes.append("kinda overwhelmed")
+        elif contentment > 0.5:
+            vibes.append("pretty chill")
+        elif energy > 0.5:
+            vibes.append("energetic")
+        elif energy < -0.2:
+            vibes.append("a bit drained")
+        elif warmth > 0.5:
+            vibes.append("feeling warm")
+        elif warmth < -0.2:
+            vibes.append("a bit withdrawn")
+        else:
+            vibes.append("just hanging")
+        
+        # Secondary descriptors (add texture)
+        if curiosity_drive > 0.4 and "curious" not in vibes[0]:
+            vibes.append("curious about things")
+        
         if self.endorphin > 0.4:
-            tones.append("buoyant")
+            vibes.append("pretty upbeat")
+        
         if self.patience < -0.2:
-            tones.append("impatient")
-        elif self.patience > 0.3:
-            tones.append("patient")
-
-        if not tones:
-            tones.append("neutral")
-
-        return " / ".join(tones)
+            vibes.append("not super patient rn")
+        
+        if confidence < -0.2:
+            vibes.append("a bit uncertain")
+        elif confidence > 0.5 and "confident" not in " ".join(vibes):
+            vibes.append("confident")
+        
+        if self.adrenaline > 0.5:
+            vibes.append("a little wired")
+        
+        if self.melatonin > 0.5:
+            vibes.append("tired")
+        
+        # Keep it concise - max 2-3 descriptors
+        if len(vibes) > 3:
+            vibes = vibes[:3]
+        
+        return ", ".join(vibes)
 
 
 def temperature_for_hormones(hormones: HormoneVector, base_temp: float) -> float:
