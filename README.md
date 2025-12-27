@@ -1,6 +1,15 @@
 Sel - Discord presence bot powered by OpenRouter and SQLAlchemy.
 
-## Setup
+## Quick Start
+
+### Windows
+1. **Run the launcher**: Double-click `sel_launcher.exe` (or run `start_sel.bat`)
+2. **Configure tokens**: Edit `.env` file with your `DISCORD_BOT_TOKEN` and `OPENROUTER_API_KEY`
+3. **Start SEL**: Run the launcher again
+
+See [WINDOWS_SETUP.md](WINDOWS_SETUP.md) for detailed Windows installation instructions.
+
+### Linux/Mac
 - Install dependencies with Poetry: `cd project_echo && poetry install`. (Or `pip install .`)
 - Export required env vars: `DISCORD_BOT_TOKEN`, `OPENROUTER_API_KEY`.
 - Optional env: `OPENROUTER_MAIN_MODEL`, `OPENROUTER_UTIL_MODEL`, `OPENROUTER_MAIN_TEMP`, `OPENROUTER_UTIL_TEMP`, `OPENROUTER_TOP_P`, `DATABASE_URL`, `WHITELIST_CHANNEL_IDS`, `SEL_PERSONA_SEED`, `INACTIVITY_PING_HOURS`, `INACTIVITY_PING_COOLDOWN_HOURS`, `INACTIVITY_PING_CHECK_SECONDS`, `HIM_MEMORY_DIR`, `HIM_MEMORY_LEVELS`.

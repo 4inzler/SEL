@@ -12,7 +12,26 @@ SEL is a Discord presence bot with an integrated Hierarchical Image Memory (HIM)
 
 ## Development Commands
 
-### Local Development
+### Windows Quick Start
+
+**Install and run (automated):**
+```batch
+# First time: install dependencies
+install_sel.ps1
+
+# Edit .env with your tokens
+# Then start SEL
+start_sel.bat
+```
+
+Or use the all-in-one launcher:
+```batch
+sel_launcher.exe
+```
+
+See [WINDOWS_SETUP.md](WINDOWS_SETUP.md) for detailed Windows instructions.
+
+### Local Development (Linux/Mac/Manual)
 
 **Install dependencies:**
 ```bash
