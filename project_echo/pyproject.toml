@@ -22,8 +22,8 @@ python-dotenv = "^1.0.1"
 pydantic-settings = "^2.2.1"
 asyncpg = ">=0.29,<0.32"
 langchain = "^0.3.0"
-pillow = "^11.0.0"
-numpy = "^1.26.0"
+pillow = "^10.0.0"
+numpy = "^1.24.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
