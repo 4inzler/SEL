@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.DS_Store
+.env
+.venv
+.cache/
+.pytest_cache/
+poetry.toml
+
+# Local data directory for tiles/snapshots
+/data/
+
+# Generated distribution bundles
+/dist/

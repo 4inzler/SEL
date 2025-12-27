@@ -1,0 +1,53 @@
+services:
+  sel-service:
+    build:
+      context: .
+      dockerfile: project_echo/Dockerfile
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MAIN_MODEL: ${OPENROUTER_MAIN_MODEL:-anthropic/claude-3.5-sonnet}
+      OPENROUTER_UTIL_MODEL: ${OPENROUTER_UTIL_MODEL:-anthropic/claude-3-haiku-20240307}
+      OPENROUTER_MAIN_TEMP: ${OPENROUTER_MAIN_TEMP:-0.8}
+      OPENROUTER_UTIL_TEMP: ${OPENROUTER_UTIL_TEMP:-0.3}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://sel:sel@db:5432/sel}
+      HIM_ENABLED: ${HIM_ENABLED:-1}
+      HIM_PORT: ${HIM_PORT:-8000}
+      HIM_DATA_DIR: ${HIM_DATA_DIR:-/app/project_echo/data}
+      HIM_MEMORY_DIR: ${HIM_MEMORY_DIR:-/app/project_echo/data/him_store}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      DBUS_SESSION_BUS_ADDRESS: ${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/${HOST_UID:-1000}/bus}
+      XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-/run/user/${HOST_UID:-1000}}
+    volumes:
+      - ./sel_data:/app/project_echo/data
+      - ./agents:/app/project_echo/agents
+      - ${DBUS_RUNTIME_DIR:-/run/user/${HOST_UID:-1000}}:${DBUS_RUNTIME_DIR:-/run/user/${HOST_UID:-1000}}
+      # Mount host home at /host/home for bash agent context; adjust as needed.
+      - ${HOST_HOME:-/home/${HOST_USER:-${HOST_UID:-1000}}}:/host/home:rw
+    restart: unless-stopped
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: sel
+      POSTGRES_PASSWORD: sel
+      POSTGRES_DB: sel
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  db_data: {}
