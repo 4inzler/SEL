@@ -1,0 +1,59 @@
+# Kubernetes Network Policy for SEL (if using K8s)
+# Blocks all incoming traffic
+# Allows only specific outbound traffic
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sel-network-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: sel-discord-bot
+  policyTypes:
+    - Ingress
+    - Egress
+
+  # BLOCK all incoming connections
+  ingress: []
+
+  # ALLOW only specific outbound connections
+  egress:
+    # Allow DNS
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Allow Discord API (443)
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+      # Discord domains:
+      # - discord.com
+      # - gateway.discord.gg
+
+    # Allow OpenRouter API (443)
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+      # OpenRouter domains:
+      # - openrouter.ai
+      # - api.openai.com
+
+    # Allow PostgreSQL (internal only)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: sel-postgres
+      ports:
+        - protocol: TCP
+          port: 5432

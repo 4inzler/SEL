@@ -1,0 +1,134 @@
+# SEL Discord Bot - SANDBOXED VERSION
+# No shell access, no host filesystem access, completely isolated
+
+version: '3.8'
+
+services:
+  sel-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sel-discord-bot
+    restart: unless-stopped
+
+    # SECURITY: Run as non-root user
+    user: "1000:1000"
+
+    # SECURITY: Maximum hardening
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=docker-default
+      - seccomp=./seccomp-profile.json
+    cap_drop:
+      - ALL
+    # NO capabilities added - not even NET_BIND_SERVICE
+
+    # SECURITY: Read-only root filesystem
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=100m
+
+    # SECURITY: Strict resource limits (prevent DoS)
+    mem_limit: 2g
+    mem_reservation: 512m
+    cpus: 2
+    pids_limit: 100
+    ulimits:
+      nproc: 100
+      nofile:
+        soft: 1024
+        hard: 2048
+
+    # SECURITY: Prevent privilege escalation
+    privileged: false
+    ipc: private
+
+    # SECURITY: Network - No listening ports exposed
+    # Only outbound connections allowed (Discord API, OpenRouter API)
+    ports: []  # NO ports exposed
+    expose: []  # NO ports exposed to other containers
+    network_mode: bridge
+
+    # SECURITY: Only data directory is writable (isolated from host)
+    volumes:
+      - sel_data:/data:rw
+      # NO HOST FILESYSTEM ACCESS
+      # NO HOME DIRECTORY MOUNT
+      # NO AGENT DIRECTORY MOUNT
+
+    # Environment variables
+    environment:
+      # Discord
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+
+      # OpenRouter LLM
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MAIN_MODEL: ${OPENROUTER_MAIN_MODEL:-anthropic/claude-3.7-sonnet}
+      OPENROUTER_UTIL_MODEL: ${OPENROUTER_UTIL_MODEL:-anthropic/claude-haiku-4.5}
+      OPENROUTER_VISION_MODEL: ${OPENROUTER_VISION_MODEL:-anthropic/claude-3-5-sonnet-20241022}
+      OPENROUTER_MAIN_TEMP: ${OPENROUTER_MAIN_TEMP:-0.8}
+      OPENROUTER_UTIL_TEMP: ${OPENROUTER_UTIL_TEMP:-0.3}
+
+      # LocalAI (optional alternative)
+      LOCALAI_BASE_URL: ${LOCALAI_BASE_URL:-http://localai:8080}
+      LOCALAI_API_KEY: ${LOCALAI_API_KEY:-}
+
+      # Database
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://sel:sel@db:5432/sel}
+
+      # HIM Memory
+      HIM_ENABLED: ${HIM_ENABLED:-1}
+      HIM_DATA_DIR: /data
+      HIM_MEMORY_DIR: /data/him_store
+
+      # Python
+      PYTHONUNBUFFERED: 1
+
+    # Network isolation
+    networks:
+      - sel-network
+
+    # Logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    container_name: sel-postgres
+    restart: unless-stopped
+
+    # Security for database
+    security_opt:
+      - no-new-privileges:true
+
+    environment:
+      POSTGRES_USER: sel
+      POSTGRES_PASSWORD: sel
+      POSTGRES_DB: sel
+
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+    networks:
+      - sel-network
+
+    # Resource limits
+    mem_limit: 1g
+    cpus: 1
+
+networks:
+  sel-network:
+    driver: bridge
+    internal: false  # Allow external (Discord API, OpenRouter)
+
+volumes:
+  sel_data:
+    driver: local
+  db_data:
+    driver: local

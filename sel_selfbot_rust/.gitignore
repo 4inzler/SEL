@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# Environment files
+selfbot.env
+.env
+
+# Logs
+*.log
+
+# Data
+sel_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

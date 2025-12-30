@@ -1,0 +1,79 @@
+#include <tunables/global>
+
+profile sel-discord-bot flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  #include <abstractions/python>
+
+  # Deny all by default
+  deny /** rwklx,
+
+  # Allow read access to application code
+  /app/** r,
+  /usr/** r,
+  /lib/** r,
+  /etc/ld.so.cache r,
+  /etc/passwd r,
+  /etc/group r,
+  /etc/nsswitch.conf r,
+  /etc/hosts r,
+  /etc/resolv.conf r,
+  /etc/ssl/** r,
+
+  # Allow write only to data directory
+  /data/** rw,
+  /tmp/** rw,
+
+  # Deny execution of shells
+  deny /bin/sh x,
+  deny /bin/bash x,
+  deny /bin/dash x,
+  deny /bin/zsh x,
+  deny /usr/bin/sh x,
+  deny /usr/bin/bash x,
+  deny /usr/bin/dash x,
+  deny /usr/bin/zsh x,
+
+  # Deny execution of dangerous commands
+  deny /bin/su x,
+  deny /usr/bin/sudo x,
+  deny /usr/bin/curl x,
+  deny /usr/bin/wget x,
+  deny /bin/nc x,
+  deny /usr/bin/nc x,
+  deny /usr/bin/ncat x,
+
+  # Deny network tools
+  deny /usr/bin/ssh x,
+  deny /usr/bin/scp x,
+  deny /usr/bin/sftp x,
+  deny /bin/netcat x,
+  deny /usr/bin/netcat x,
+
+  # Allow Python execution
+  /usr/bin/python3* rix,
+
+  # Network access (required for Discord API)
+  network inet stream,
+  network inet6 stream,
+  network inet dgram,
+  network inet6 dgram,
+
+  # Deny ptrace (prevents debugging/injection)
+  deny ptrace,
+
+  # Deny mount operations
+  deny mount,
+  deny remount,
+  deny umount,
+
+  # Deny capability escalation
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_rawio,
+  deny capability sys_ptrace,
+  deny capability sys_chroot,
+  deny capability setuid,
+  deny capability setgid,
+  deny capability net_admin,
+  deny capability net_raw,
+}

@@ -1,0 +1,160 @@
+name: Security Scans
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for secret scanning
+
+    - name: Run Gitleaks
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install safety pip-audit
+
+    - name: Run Safety check
+      continue-on-error: true
+      run: |
+        cd project_echo
+        safety check --json --output safety-report.json || true
+        cat safety-report.json
+
+    - name: Run pip-audit
+      continue-on-error: true
+      run: |
+        cd project_echo
+        pip-audit --desc --output pip-audit-report.json || true
+
+    - name: Upload vulnerability reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: vulnerability-reports
+        path: |
+          project_echo/safety-report.json
+          project_echo/pip-audit-report.json
+
+  codeql-analysis:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: python
+        queries: security-and-quality
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+
+  docker-security:
+    name: Docker Security Scan
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build Docker image
+      run: docker build -t sel-security-scan:latest .
+
+    - name: Run Trivy scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: sel-security-scan:latest
+        format: 'sarif'
+        output: 'trivy-docker-results.sarif'
+
+    - name: Upload Trivy results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-docker-results.sarif'
+
+    - name: Run Grype scan
+      uses: anchore/scan-action@v3
+      with:
+        image: sel-security-scan:latest
+        fail-build: false
+        severity-cutoff: critical
+
+  container-hardening-check:
+    name: Container Hardening Verification
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build Docker image
+      run: docker-compose build
+
+    - name: Verify no shells in container
+      run: |
+        echo "Checking for shell binaries..."
+        docker run --rm sel-discord-bot ls /bin/sh 2>&1 | grep "No such file" || exit 1
+        docker run --rm sel-discord-bot ls /bin/bash 2>&1 | grep "No such file" || exit 1
+        echo "✓ Shells successfully removed"
+
+    - name: Verify non-root user
+      run: |
+        echo "Checking container user..."
+        USER=$(docker inspect sel-discord-bot --format='{{.Config.User}}')
+        if [ "$USER" != "1000:1000" ]; then
+          echo "✗ Container not running as UID 1000"
+          exit 1
+        fi
+        echo "✓ Running as non-root user (UID 1000)"
+
+    - name: Verify no ports exposed
+      run: |
+        echo "Checking for exposed ports..."
+        PORTS=$(docker port sel-discord-bot 2>&1)
+        if [ -n "$PORTS" ]; then
+          echo "✗ Ports exposed: $PORTS"
+          exit 1
+        fi
+        echo "✓ No ports exposed"
+
+    - name: Verify security options
+      run: |
+        echo "Checking security options..."
+        docker inspect sel-discord-bot --format='{{json .HostConfig.SecurityOpt}}' | grep "no-new-privileges" || exit 1
+        echo "✓ no-new-privileges enabled"
+
+    - name: Verify capabilities dropped
+      run: |
+        echo "Checking capabilities..."
+        docker inspect sel-discord-bot --format='{{json .HostConfig.CapDrop}}' | grep "ALL" || exit 1
+        echo "✓ All capabilities dropped"

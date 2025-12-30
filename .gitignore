@@ -1,0 +1,113 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.egg-info/
+.Python
+MANIFEST
+
+# Build artifacts
+build/
+dist/
+*.spec.backup
+*.spec
+
+# PyInstaller artifacts
+*.exe
+!sel_launcher.exe
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+project_echo/.venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# Linting
+.ruff_cache/
+
+# Data directories
+sel_data/
+project_echo/data/
+project_echo/tmp_him/
+him_store/
+memory_store/
+data/
+
+# Database files
+*.sqlite
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+._*
+
+# IDE
+.claude/
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
+*~
+nul
+
+# Secrets
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+.secrets.baseline
+user_profiles.json
+
+# Pre-commit
+.pre-commit-config.yaml.backup

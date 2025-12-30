@@ -1,0 +1,85 @@
+SEL Windows Compatibility - File Summary
+=========================================
+
+INSTALLATION SCRIPTS:
+---------------------
+install_sel.ps1              - PowerShell installer (checks Python, installs Poetry, sets up deps)
+start_sel.bat                - Batch file launcher (loads .env, starts HIM + bot)
+check_system.bat             - System requirements checker (verifies readiness)
+
+EXECUTABLE LAUNCHER:
+--------------------
+windows_launcher.py          - Python source for all-in-one executable
+sel_windows.spec             - PyInstaller configuration
+build_windows_exe.bat        - Windows build script
+build_windows_exe.sh         - Linux/WSL build script
+
+DOCUMENTATION:
+--------------
+WINDOWS_README.md            - Simple user guide for beginners
+WINDOWS_INSTALL.md           - Complete installation guide (all methods)
+WINDOWS_SETUP.md             - Detailed setup and troubleshooting
+WINDOWS_QUICK_REF.md         - Quick reference for common tasks
+BUILDING_WINDOWS_EXE.md      - Guide for building and distributing exe
+WINDOWS_IMPLEMENTATION.md    - Technical implementation details
+
+UPDATED FILES:
+--------------
+README.md                    - Added Windows quick start section
+CLAUDE.md                    - Added Windows development commands
+.gitignore                   - Added PyInstaller artifacts
+
+USAGE:
+------
+For end users:
+  1. Run: install_sel.ps1
+  2. Edit: .env (add tokens)
+  3. Run: start_sel.bat
+
+For executable distribution:
+  1. Build: build_windows_exe.bat
+  2. Distribute: sel_launcher.exe + project_echo/ + .env.example
+  3. User runs: sel_launcher.exe
+
+For developers:
+  - Manual setup: See WINDOWS_INSTALL.md Method 3
+  - Testing: poetry run pytest
+  - Building: pyinstaller sel_windows.spec
+
+DISTRIBUTION PACKAGE:
+---------------------
+Recommended structure:
+  SEL-Windows/
+  ├── sel_launcher.exe or (install_sel.ps1 + start_sel.bat)
+  ├── project_echo/
+  ├── agents/
+  ├── .env.example
+  ├── WINDOWS_README.md → README.md (rename for users)
+  ├── WINDOWS_SETUP.md
+  └── LICENSE.md
+
+SIZE ESTIMATES:
+---------------
+Scripts: ~15 KB
+Documentation: ~50 KB
+Executable: ~10-15 MB (if built)
+Full package: ~50 MB compressed
+
+DEPENDENCIES:
+-------------
+Required:
+  - Python 3.11+
+  - Poetry (auto-installed)
+  - DISCORD_BOT_TOKEN
+  - OPENROUTER_API_KEY
+
+Optional:
+  - PyInstaller (for building exe)
+  - Docker Desktop (for container deployment)
+
+SUPPORT:
+--------
+Main guide: WINDOWS_INSTALL.md
+Quick help: WINDOWS_QUICK_REF.md
+Troubleshooting: WINDOWS_SETUP.md
+Building: BUILDING_WINDOWS_EXE.md
