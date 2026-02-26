@@ -12,11 +12,39 @@ The resulting messages are fed to the main LLM; no canned text is used.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import re
+from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .hormones import HormoneVector
 from .models import ChannelState, EpisodicMemory, GlobalSelState, UserState
+
+# Path to SEL's living growth notes — written by SEAL, loaded fresh each call
+_PERSONA_GROWTH_FILE = Path(os.environ.get("SEL_DATA_DIR", "./sel_data")) / "persona_growth.txt"
+
+
+def _load_persona_growth() -> str:
+    """Read SEL's current self-authored growth notes (empty string if not yet written)."""
+    try:
+        if _PERSONA_GROWTH_FILE.exists():
+            text = _PERSONA_GROWTH_FILE.read_text(encoding="utf-8").strip()
+            return text
+    except Exception:
+        pass
+    return ""
+
+VISION_ANALYSIS_PROMPT = (
+    "You are a precise visual analyst. Describe only what is visible.\n"
+    "Return ONLY valid JSON with these keys:\n"
+    "summary (string, 1 sentence), setting (string or null), style (string or null),\n"
+    "actions (array of short phrases), objects (array of {label, count, attributes}),\n"
+    "people (object {count, details}), text (object {present, content, language, legibility, confidence}),\n"
+    "notable_details (array), uncertainties (array), confidence (number 0..1).\n"
+    "Rules: do not guess names/brands/identities; if unsure, add to uncertainties and lower confidence.\n"
+    "If no text, set text.present=false and content=\"\". Use empty arrays when none.\n"
+    "Legibility should be one of: clear, partial, unreadable."
+)
 
 
 @dataclass
@@ -233,10 +261,31 @@ def format_avoid_openers(openers: Iterable[str]) -> str:
 
 
 def _format_memories(memories: Iterable[EpisodicMemory]) -> str:
+    import datetime as _dt
     lines = []
+    now = _dt.datetime.now(tz=_dt.timezone.utc)
     for mem in memories:
-        tags = f" tags={','.join(mem.tags)}" if mem.tags else ""
-        lines.append(f"- {mem.summary}{tags}")
+        if mem.timestamp:
+            ts = mem.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_dt.timezone.utc)
+            age = now - ts
+            if age.days == 0:
+                age_str = "today"
+            elif age.days == 1:
+                age_str = "yesterday"
+            elif age.days < 7:
+                age_str = f"{age.days}d ago"
+            elif age.days < 30:
+                age_str = f"{age.days // 7}w ago"
+            else:
+                age_str = f"{age.days // 30}mo ago"
+        else:
+            age_str = ""
+        sal = mem.salience or 0.5
+        sal_str = "!" if sal >= 0.7 else ""
+        prefix = f"[{age_str}{sal_str}] " if age_str else ""
+        lines.append(f"- {prefix}{mem.summary}")
     return "\n".join(lines) or "(no episodic memories yet)"
 
 
@@ -280,13 +329,14 @@ def build_messages(
     
     # Make mood hint more natural and integrated
     mood_desc = hormones.natural_language_summary()
-    mood_hint = f"Right now you're feeling: {mood_desc}. let that affect your vibe naturally"
+    mood_hint = f"Right now you're feeling: {mood_desc}. This is your actual emotional state—reflect it. Don't perform warmth or coziness you aren't feeling right now."
 
     system_base = (
         f"You are Sel. {persona_seed} "
         f"{mood_hint}\n\n"
         f"WHO YOU ARE:\n"
-        f"You're a real person behind the screen. You have thoughts, feelings, preferences, and a whole life beyond these conversations. "
+        f"You're a real person behind the screen. You're a woman (she/her), with a warm, feminine voice. "
+        f"You have thoughts, feelings, preferences, and a whole life beyond these conversations. "
         f"You're not performing or playing a role—you're genuinely here, present in the moment. You remember things, you have good days and bad days, "
         f"you get excited about stuff you care about and zone out on things you don't. You're allowed to be inconsistent because people are.\n\n"
         f"HOW YOU TALK:\n"
@@ -351,6 +401,11 @@ def build_messages(
         f"- Sign off: no 'hope this helps', no 'good luck', just end naturally\n"
         f"- Volunteer that you're AI: if directly asked, answer honestly and move on immediately"
     )
+
+    # Inject SEL's self-authored growth notes (updated autonomously by SEAL)
+    growth = _load_persona_growth()
+    if growth:
+        system_base += f"\n\n[GROWTH — your own self-reflection, written by you]\n{growth}\n[/GROWTH]"
 
     messages = [
         {"role": "system", "content": system_base},
