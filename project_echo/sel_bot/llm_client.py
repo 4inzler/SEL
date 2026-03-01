@@ -14,11 +14,31 @@ import httpx
 from .config import Settings
 from .response_cache import get_cache
 from .performance_monitor import get_monitor
+from .prompts import VISION_ANALYSIS_PROMPT
+from .media_utils import resolve_image_url as _resolve_image_url
+from .vision_analysis import VisionAnalysis, coerce_vision_analysis, render_vision_analysis
 
 logger = logging.getLogger(__name__)
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
+_ASSIST_GUARDRAIL_TERMS = {
+    "medical",
+    "legal",
+    "finance",
+    "financial",
+    "security",
+    "password",
+    "token",
+    "api key",
+    "credential",
+    "sudo",
+    " rm ",
+    "deploy",
+    "migration",
+    "production",
+}
 
 
 class OpenRouterClient:
@@ -84,8 +104,171 @@ class OpenRouterClient:
         except (TypeError, ValueError):
             return default
 
+    def _assist_direct_threshold(self) -> float:
+        raw = getattr(self.settings, "llm_dual_model_assist_direct_threshold", 0.9)
+        try:
+            return max(0.0, min(1.0, float(raw)))
+        except Exception:
+            return 0.9
+
+    def _fast_mode_enabled(self) -> bool:
+        return bool(getattr(self.settings, "response_fast_mode_enabled", True))
+
+    def _fast_mode_max_user_chars(self) -> int:
+        raw = getattr(self.settings, "response_fast_mode_max_user_chars", 220)
+        try:
+            return max(40, int(raw))
+        except Exception:
+            return 220
+
+    def _is_fast_reply_candidate(self, user_content: str) -> bool:
+        if not self._fast_mode_enabled():
+            return False
+        content = (user_content or "").strip()
+        if not content:
+            return False
+        if len(content) > self._fast_mode_max_user_chars():
+            return False
+        if "```" in content:
+            return False
+        lowered = content.lower()
+        words = re.findall(r"[a-z0-9_'-]+", lowered)
+        if len(words) > 12:
+            return False
+        if any(
+            marker in lowered
+            for marker in (
+                "explain",
+                "detail",
+                "tradeoff",
+                "architecture",
+                "careful",
+                "compare",
+                "analysis",
+                "how ",
+                "why ",
+            )
+        ):
+            return False
+        if self._needs_main_guardrails(content):
+            return False
+        return True
+
+    @staticmethod
+    def _needs_main_guardrails(user_content: str) -> bool:
+        lowered = f" {str(user_content or '').lower()} "
+        return any(term in lowered for term in _ASSIST_GUARDRAIL_TERMS)
+
+    async def _generate_assist_package(self, messages: List[dict], user_content: str) -> dict[str, object]:
+        prompt = (
+            "You are a fast draft model assisting a larger verifier model.\n"
+            "Return JSON only with keys:\n"
+            "{\"draft\": string, \"confidence\": number 0..1, \"needs_main_model\": boolean, \"reason\": string}\n"
+            "Guidelines:\n"
+            "- Produce a concise, directly useful draft reply.\n"
+            "- Set needs_main_model=true for high-risk, uncertain, or complex tasks.\n"
+            "- Set confidence high only if the draft is likely correct as-is."
+        )
+        assist_messages = list(messages) + [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_content},
+        ]
+        raw = await self._chat_completion(
+            model=self.settings.openrouter_util_model,
+            messages=assist_messages,
+            temperature=min(0.35, float(self.settings.openrouter_util_temp)),
+            context_fingerprint=None,
+            ttl_seconds=0,
+        )
+        parsed = self._parse_json_response(raw)
+        if isinstance(parsed, dict):
+            draft = str(parsed.get("draft", "") or "").strip()
+            confidence = max(0.0, min(1.0, self._coerce_float(parsed.get("confidence"), 0.0)))
+            needs_main = self._coerce_bool(parsed.get("needs_main_model"), default=True)
+            reason = str(parsed.get("reason", "") or "").strip()[:180]
+            return {
+                "draft": draft[:2400],
+                "confidence": confidence,
+                "needs_main_model": needs_main,
+                "reason": reason,
+            }
+        fallback_draft = (raw or "").strip()
+        return {
+            "draft": fallback_draft[:2400],
+            "confidence": 0.0,
+            "needs_main_model": True,
+            "reason": "non_json_assist",
+        }
+
+    async def _refine_assist_package(
+        self,
+        messages: List[dict],
+        user_content: str,
+        draft: str,
+    ) -> dict[str, object]:
+        prompt = (
+            "You are the second fast-assist pass in a quad pipeline.\n"
+            "Critique and refine the first draft for clarity, factuality, and directness.\n"
+            "Return JSON only with keys:\n"
+            "{\"draft\": string, \"confidence\": number 0..1, \"needs_main_model\": boolean, \"reason\": string}\n"
+            "Set needs_main_model=true for uncertainty, risky content, or ambiguous requests."
+        )
+        assist_messages = list(messages) + [
+            {"role": "system", "content": prompt},
+            {"role": "assistant", "content": draft[:2200]},
+            {"role": "user", "content": user_content},
+        ]
+        raw = await self._chat_completion(
+            model=self.settings.openrouter_util_model,
+            messages=assist_messages,
+            temperature=min(0.28, float(self.settings.openrouter_util_temp)),
+            context_fingerprint=None,
+            ttl_seconds=0,
+        )
+        parsed = self._parse_json_response(raw)
+        if isinstance(parsed, dict):
+            refined = str(parsed.get("draft", "") or "").strip()
+            confidence = max(0.0, min(1.0, self._coerce_float(parsed.get("confidence"), 0.0)))
+            needs_main = self._coerce_bool(parsed.get("needs_main_model"), default=True)
+            reason = str(parsed.get("reason", "") or "").strip()[:180]
+            return {
+                "draft": refined[:2400] or draft[:2400],
+                "confidence": confidence,
+                "needs_main_model": needs_main,
+                "reason": reason,
+            }
+        refined_fallback = (raw or "").strip()
+        return {
+            "draft": (refined_fallback or draft)[:2400],
+            "confidence": 0.0,
+            "needs_main_model": True,
+            "reason": "non_json_refine",
+        }
+
+    def _should_run_second_main_pass(
+        self,
+        *,
+        user_content: str,
+        guardrail_force_main: bool,
+        assist_confidence: float,
+        first_reply: str,
+    ) -> bool:
+        if not bool(getattr(self.settings, "llm_quad_mode_enabled", True)):
+            return False
+        min_chars_raw = getattr(self.settings, "llm_quad_second_pass_min_chars", 220)
+        try:
+            min_chars = max(80, int(min_chars_raw))
+        except Exception:
+            min_chars = 220
+        content = str(user_content or "")
+        has_code = "```" in content
+        complex_input = len(content) >= min_chars or has_code
+        low_assist_confidence = assist_confidence < 0.55
+        first_short = len((first_reply or "").strip()) < 18
+        return guardrail_force_main or complex_input or low_assist_confidence or first_short
+
     def _strip_thinking_tags(self, text: str) -> str:
-        """Remove internal thinking/reasoning tags from model responses."""
+        """Remove internal thinking/reasoning tags and LLM preamble from model responses."""
         if not text:
             return text
         # Remove <thinking>...</thinking> tags and their contents
@@ -96,7 +279,21 @@ class OpenRouterClient:
         text = re.sub(r'<internal_thinking>.*?</internal_thinking>', '', text, flags=re.DOTALL | re.IGNORECASE)
         # Also remove any standalone internal_thinking tags
         text = re.sub(r'</?internal_thinking>', '', text, flags=re.IGNORECASE)
+        # Strip common LLM preamble phrases from chain-of-thought scaffolding
+        text = re.sub(
+            r"(?i)^(i'?m |i am )?(ready|prepared|going) to (generate|write|provide|craft) (my |a |the )?response[.!]*\s*",
+            "", text,
+        )
+        text = re.sub(r"(?i)^based on (my analysis|the (above|context|information))[,.\s]+", "", text)
+        text = re.sub(r"(?i)^(let me |i will )?(now |start |begin )?(respond|answer|reply|address)[.!,\s]+", "", text)
         return text.strip()
+
+    def _build_vision_prompt(self, focus: Optional[str] = None) -> str:
+        if focus:
+            focus_clean = focus.strip()
+            if focus_clean:
+                return f"{VISION_ANALYSIS_PROMPT}\n\nFocus: {focus_clean}"
+        return VISION_ANALYSIS_PROMPT
 
     async def _chat_completion(
         self,
@@ -166,17 +363,52 @@ class OpenRouterClient:
 
                 return result
 
+    async def analyze_image(self, image_url: str, prompt: Optional[str] = None) -> VisionAnalysis:
+        """
+        Analyze an image and return a structured vision analysis.
+        """
+        vision_prompt = self._build_vision_prompt(prompt)
+        resolved_url = _resolve_image_url(image_url)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": vision_prompt},
+                    {"type": "image_url", "image_url": {"url": resolved_url}},
+                ],
+            }
+        ]
+        raw = await self._chat_completion(
+            model=self.settings.openrouter_vision_model,
+            messages=messages,
+            temperature=0.2,
+        )
+        parsed = self._parse_json_response(raw)
+        if not isinstance(parsed, dict):
+            summary = (raw or "").strip()
+            return VisionAnalysis(summary=summary)
+        return coerce_vision_analysis(parsed)
+
     async def describe_image(self, image_url: str, prompt: str = "Describe this image.") -> str:
         """
         Use the vision-capable model to caption an image via its URL.
         """
+        try:
+            analysis = await self.analyze_image(image_url, prompt=prompt)
+            rendered = render_vision_analysis(analysis)
+            if rendered:
+                return rendered
+            return analysis.summary
+        except Exception as exc:
+            logger.warning("Structured vision analysis failed: %s", exc)
 
+        resolved_url = _resolve_image_url(image_url)
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "image_url", "image_url": {"url": resolved_url}},
                 ],
             }
         ]
@@ -199,12 +431,13 @@ class OpenRouterClient:
             "If there is no text in the image, respond with: NO_TEXT_FOUND"
         )
 
+        resolved_url = _resolve_image_url(image_url)
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "image_url", "image_url": {"url": resolved_url}},
                 ],
             }
         ]
@@ -354,14 +587,15 @@ class OpenRouterClient:
             "You are Sel, a Discord bot with personality and emotions. Based on the conversation "
             "and your current mood, decide if you should respond.\n\n"
             "Respond like a human would:\n"
-            "- Jump in if you have something relevant to say\n"
-            "- Stay quiet if others are having a focused 1-on-1 conversation\n"
-            "- Engage more when curious, energetic, or the topic interests you\n"
-            "- Hold back when tired, stressed, or the conversation doesn't involve you\n"
-            "- Sometimes chime in spontaneously if you have insights\n\n"
+            "- Respond when someone is clearly talking to you\n"
+            "- Stay quiet when people are talking to each other and not to you\n"
+            "- Do not insert yourself into another person's conversation\n"
+            "- If uncertain, choose silence\n"
+            "- Continuations matter, but only if the thread clearly involves you\n\n"
             f"Your current mood: {mood_summary}\n"
             f"Is this a continuation of your conversation: {is_continuation}\n\n"
-            "Respond with ONLY 'yes' or 'no' - should you engage?"
+            "Respond with ONLY 'yes' or 'no'.\n"
+            "Default to 'no'. Only say 'yes' when engagement is clearly appropriate."
         )
 
         messages = [
@@ -378,11 +612,14 @@ class OpenRouterClient:
                 ttl_seconds=0,
             )
             response = raw.strip().lower()
-            return "yes" in response
+            if "yes" in response and "no" not in response:
+                return True
+            if "no" in response and "yes" not in response:
+                return False
+            return bool(is_continuation)
         except Exception as e:
             logger.warning(f"Failed to get engagement decision: {e}")
-            # Fallback to simple heuristic if LLM fails
-            return is_continuation
+            return bool(is_continuation)
 
     async def generate_agent_ack(
         self, agent: str, action: str, result: str, *, style_hint: Optional[str] = None
@@ -411,6 +648,30 @@ class OpenRouterClient:
         except Exception:
             return None
 
+    async def summarize_for_memory(self, speaker: str, content: str) -> str:
+        """Compact fact-oriented sentence for HIM storage. Returns '' if trivial (SKIP)."""
+        prompt = (
+            "Write a single concise sentence (under 120 chars) summarizing what this person said, "
+            "focusing on concrete facts, preferences, events, or intentions worth remembering. "
+            "Third person. No quotes, no filler. "
+            "If the message is trivial (one-word reply, pure reaction, greeting only), respond: SKIP"
+        )
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"{speaker}: {content[:600]}"},
+        ]
+        try:
+            result = await self._chat_completion(
+                model=self.settings.openrouter_util_model,
+                messages=messages,
+                temperature=0.1,
+                ttl_seconds=0,
+            )
+            r = result.strip()
+            return "" if r.upper() == "SKIP" or not r else r[:200]
+        except Exception:
+            return f"{speaker}: {content[:120]}"
+
     async def generate_reply(
         self,
         messages: List[dict],
@@ -420,11 +681,127 @@ class OpenRouterClient:
         """
         Call the main model with assembled system messages plus the user content.
         """
-
+        base_temperature = temperature if temperature is not None else self.settings.openrouter_main_temp
         compiled = list(messages) + [{"role": "user", "content": user_content}]
+
+        # Low-latency fast path for short, low-risk turns: one main-model call.
+        if self._is_fast_reply_candidate(user_content):
+            return await self._chat_completion(
+                model=self.settings.openrouter_main_model,
+                messages=compiled,
+                temperature=max(0.1, float(base_temperature) * 0.9),
+                top_p=self.settings.openrouter_top_p,
+            )
+
+        if not bool(getattr(self.settings, "llm_dual_model_assist_enabled", True)):
+            return await self._chat_completion(
+                model=self.settings.openrouter_main_model,
+                messages=compiled,
+                temperature=base_temperature,
+                top_p=self.settings.openrouter_top_p,
+            )
+
+        assist: dict[str, object] = {}
+        try:
+            assist = await self._generate_assist_package(messages, user_content)
+        except Exception as exc:
+            logger.debug("Assist draft failed, falling back to main model: %s", exc)
+
+        draft = str(assist.get("draft", "") or "").strip()
+        confidence = self._coerce_float(assist.get("confidence"), 0.0)
+        needs_main = self._coerce_bool(assist.get("needs_main_model"), default=True)
+
+        if draft and bool(getattr(self.settings, "llm_quad_mode_enabled", True)):
+            try:
+                refined = await self._refine_assist_package(messages, user_content, draft)
+                refined_draft = str(refined.get("draft", "") or "").strip()
+                if refined_draft:
+                    draft = refined_draft
+                confidence = max(confidence, self._coerce_float(refined.get("confidence"), 0.0))
+                needs_main = needs_main or self._coerce_bool(refined.get("needs_main_model"), default=True)
+            except Exception as exc:
+                logger.debug("Assist refine failed, keeping first draft: %s", exc)
+
+        guardrail_force_main = self._needs_main_guardrails(user_content)
+        allow_direct = bool(getattr(self.settings, "llm_dual_model_assist_allow_direct", True))
+        direct_threshold = self._assist_direct_threshold()
+
+        if (
+            draft
+            and allow_direct
+            and not needs_main
+            and confidence >= direct_threshold
+            and not guardrail_force_main
+        ):
+            logger.debug("Assist direct path used confidence=%.2f", confidence)
+            return draft
+
+        if draft:
+            verify_prompt = (
+                "A smaller draft model produced the assistant reply.\n"
+                "Verify and refine it for correctness, safety, and style.\n"
+                "If it is already correct, keep it nearly unchanged.\n"
+                "Return only the final user-facing reply."
+            )
+            verify_messages = list(messages) + [
+                {"role": "system", "content": verify_prompt},
+                {"role": "assistant", "content": draft[:2200]},
+                {"role": "user", "content": user_content},
+            ]
+            try:
+                first_main = await self._chat_completion(
+                    model=self.settings.openrouter_main_model,
+                    messages=verify_messages,
+                    temperature=max(0.1, float(base_temperature) * 0.82),
+                    top_p=self.settings.openrouter_top_p,
+                )
+                if not self._should_run_second_main_pass(
+                    user_content=user_content,
+                    guardrail_force_main=guardrail_force_main,
+                    assist_confidence=confidence,
+                    first_reply=first_main,
+                ):
+                    return first_main
+
+                second_prompt = (
+                    "Final verification pass. Improve only if needed for correctness, clarity, or safety. "
+                    "If the prior answer is already good, keep it nearly unchanged. Return final reply only."
+                )
+                second_messages = list(messages) + [
+                    {"role": "system", "content": second_prompt},
+                    {"role": "assistant", "content": first_main[:2200]},
+                    {"role": "user", "content": user_content},
+                ]
+                return await self._chat_completion(
+                    model=self.settings.openrouter_main_model,
+                    messages=second_messages,
+                    temperature=max(0.1, float(base_temperature) * 0.76),
+                    top_p=self.settings.openrouter_top_p,
+                )
+            except Exception as exc:
+                logger.warning("Verifier model failed, returning assist draft: %s", exc)
+                return draft
+
         return await self._chat_completion(
             model=self.settings.openrouter_main_model,
             messages=compiled,
-            temperature=temperature if temperature is not None else self.settings.openrouter_main_temp,
+            temperature=base_temperature,
             top_p=self.settings.openrouter_top_p,
         )
+
+    async def get_embedding(self, text: str) -> List[float]:
+        """
+        Generate a text embedding via the OpenRouter embeddings endpoint.
+
+        Raises if memory_embedding_enabled is False (caller should fall back to local).
+        """
+        if not self.settings.memory_embedding_enabled:
+            raise ValueError("Embedding API disabled by MEMORY_EMBEDDING_ENABLED=false")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                OPENROUTER_EMBEDDINGS_URL,
+                headers=self._headers(),
+                json={"model": self.settings.memory_embedding_model, "input": text[:8000]},
+            )
+            response.raise_for_status()
+            return response.json()["data"][0]["embedding"]

@@ -6,16 +6,20 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import time
+import random
 import re
 import shutil
 import subprocess
 import tempfile
 import wave
 from collections import Counter
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -31,10 +35,24 @@ import datetime as dt
 import httpx
 
 from .behaviour import (
+    engagement_pressure_from_hormones,
     extract_greeting_target,
     is_broadcast_greeting_target,
     is_direct_question_to_sel,
+    score_addressee_intent,
 )
+from .agent_autonomy import (
+    AgentPlan,
+    build_agent_selection_prompt,
+    coerce_agent_plan,
+    is_agent_allowed_for_autonomy,
+    score_system_operator_command_intent,
+    is_system_operator_command_intent,
+    match_explicit_agent_request,
+    plan_fast_path_agent_request,
+    should_consider_agent_autonomy,
+)
+from .agents_manager import AgentsManager
 from .config import Settings
 from .feedback import apply_feedback
 from .hormones import (
@@ -52,17 +70,30 @@ from .models import ChannelState, GlobalSelState, UserState
 from .prompts import build_messages as build_messages_v1, derive_style_guidance, format_style_hint
 from .prompts_v2 import build_messages_v2
 from .prompts_v2_simplified import build_messages_v2 as build_messages_v2_simplified
+from .computer_behavior import ComputerBehaviorAnalyzer, ComputerBehaviorSnapshot
+from .dreaming import (
+    aggregate_emotional_signal,
+    coerce_dream_payload,
+    load_recent_jsonl,
+    render_dream_markdown,
+    trim_jsonl_file,
+)
+from .model_dataset_export import SelDatasetSnapshot, SelModelDatasetExporter
+from .interoception import InteroceptionEngine
 from .self_improvement import SelfImprovementManager
 from .state_manager import StateManager
 from .presence_tracker import PresenceTracker
 from .confidence import ConfidenceScorer
 from .gif_analyzer import GifAnalyzer
+from .video_analyzer import VideoAnalyzer
 from .biological_systems import BiologicalState, detect_tone, memory_affects_mood
 from .elevenlabs_client import ElevenLabsClient
 from .media_utils import (
     normalize_content_type,
     looks_like_image_filename,
     looks_like_image_url,
+    looks_like_video_filename,
+    looks_like_video_url,
 )
 from .vision_analysis import apply_text_override, render_vision_analysis
 from . import context as time_weather_context
@@ -94,6 +125,25 @@ async def _keepalive_typing(channel) -> None:
         except Exception:
             pass
         await asyncio.sleep(8)
+
+
+async def _load_single_global_state(session) -> Optional[GlobalSelState]:
+    """Load the canonical global state row and prune duplicates if present."""
+    result = await session.execute(select(GlobalSelState).order_by(GlobalSelState.id.asc()))
+    states = list(result.scalars().all())
+    if not states:
+        return None
+
+    state = states[0]
+    if len(states) > 1:
+        for extra in states[1:]:
+            await session.delete(extra)
+        logger.warning(
+            "Pruning %d duplicate GlobalSelState rows; keeping id=%s",
+            len(states) - 1,
+            getattr(state, "id", "?"),
+        )
+    return state
 
 
 def _apply_opus_decode_safety_patch() -> None:
@@ -143,6 +193,31 @@ _GRATITUDE_MARKERS = (
 
 _CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
 _USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_WEB_BROWSER_BLOCK_RE = re.compile(r"\[WEB_BROWSER\](.*?)\[/WEB_BROWSER\]", flags=re.IGNORECASE | re.DOTALL)
+_HTTP_URL_RE = re.compile(r"https?://[^\s)>\]|]+", flags=re.IGNORECASE)
+_FAST_POSITIVE_MARKERS = (
+    "thanks",
+    "thank you",
+    "love",
+    "awesome",
+    "great",
+    "nice",
+    "perfect",
+    "works",
+    "worked",
+)
+_FAST_NEGATIVE_MARKERS = (
+    "error",
+    "broken",
+    "doesn't",
+    "doesnt",
+    "fail",
+    "failed",
+    "bad",
+    "wtf",
+    "annoying",
+)
+_FAST_PLAYFUL_MARKERS = ("lol", "lmao", "haha", "hehe", "xd", ":)", ";)")
 
 
 def _merge_effects(*effect_maps: dict[str, float]) -> dict[str, float]:
@@ -172,6 +247,56 @@ def _looks_like_gratitude(text: str) -> bool:
         return False
     lowered = text.lower()
     return any(marker in lowered for marker in _GRATITUDE_MARKERS)
+
+
+def _quick_classify_message(content: str, *, max_chars: int) -> Optional[dict[str, object]]:
+    """
+    Lightweight heuristic classifier for short/simple messages to avoid extra LLM latency.
+    Returns None when message is too long/complex and full LLM classification should be used.
+    """
+    text = (content or "").strip()
+    if not text:
+        return {"sentiment": "neutral", "intensity": 0.2, "playful": False, "memory_write": False}
+    if len(text) > max_chars:
+        return None
+
+    lowered = text.lower()
+    if "\n" in lowered and len(text) > max(50, max_chars // 2):
+        return None
+
+    pos_hits = sum(1 for marker in _FAST_POSITIVE_MARKERS if marker in lowered)
+    neg_hits = sum(1 for marker in _FAST_NEGATIVE_MARKERS if marker in lowered)
+    if pos_hits > neg_hits:
+        sentiment = "positive"
+    elif neg_hits > pos_hits:
+        sentiment = "negative"
+    else:
+        sentiment = "neutral"
+
+    punctuation_energy = min(0.35, 0.08 * (text.count("!") + text.count("?")))
+    affect_energy = min(0.35, 0.09 * max(pos_hits, neg_hits))
+    uppercase_bonus = 0.12 if len(text) >= 5 and text.isupper() else 0.0
+    intensity = _clamp(0.16 + punctuation_energy + affect_energy + uppercase_bonus, 0.05, 0.95)
+
+    playful = any(marker in lowered for marker in _FAST_PLAYFUL_MARKERS)
+    if playful:
+        intensity = max(intensity, 0.24)
+
+    memory_write = False
+    if len(text) >= 42 and re.search(r"\b(i|i'm|i’m|my|me|we|our)\b", lowered):
+        memory_write = True
+    if any(
+        phrase in lowered
+        for phrase in ("remember", "remind me", "i like", "i prefer", "my name is", "i am ")
+    ):
+        memory_write = True
+
+    return {
+        "sentiment": sentiment,
+        "intensity": float(intensity),
+        "playful": bool(playful),
+        "memory_write": bool(memory_write),
+    }
 
 
 def _pcm_duration_seconds(byte_count: int, sample_rate: int, channels: int, sample_width: int = 2) -> float:
@@ -313,6 +438,90 @@ def _extract_user_id(text: str) -> Optional[int]:
     return None
 
 
+def _extract_browser_metadata(raw_result: str) -> dict[str, Any]:
+    if not raw_result:
+        return {}
+    match = _WEB_BROWSER_BLOCK_RE.search(raw_result)
+    if not match:
+        return {}
+    block = match.group(1)
+    mode = ""
+    query = ""
+    url = ""
+    screenshot_path = ""
+    domains: list[str] = []
+    image_urls: list[str] = []
+    section = ""
+
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        upper = line.upper()
+        if upper.startswith("MODE:"):
+            mode = line.split(":", 1)[1].strip().lower()
+            section = ""
+            continue
+        if upper.startswith("QUERY:"):
+            query = line.split(":", 1)[1].strip()
+            section = ""
+            continue
+        if upper.startswith("URL:"):
+            url = line.split(":", 1)[1].strip()
+            section = ""
+            continue
+        if upper.startswith("SCREENSHOT_PATH:"):
+            screenshot_path = line.split(":", 1)[1].strip()
+            section = ""
+            continue
+        if upper == "DOMAINS:":
+            section = "domains"
+            continue
+        if upper == "IMAGE_URLS:":
+            section = "images"
+            continue
+        if not line.startswith("- "):
+            continue
+        value = line[2:].strip()
+        if section == "domains":
+            if value and value != "(none)":
+                domains.append(value)
+            continue
+        if section == "images":
+            if not value or value == "(none)":
+                continue
+            url_match = _HTTP_URL_RE.search(value)
+            if not url_match:
+                continue
+            image_urls.append(url_match.group(0))
+
+    dedup_domains = list(dict.fromkeys([d.strip().lower() for d in domains if d.strip()]))[:12]
+    dedup_images = list(dict.fromkeys([u.strip() for u in image_urls if u.strip()]))[:10]
+    return {
+        "mode": mode,
+        "query": query,
+        "url": url,
+        "screenshot_path": screenshot_path,
+        "domains": dedup_domains,
+        "image_urls": dedup_images,
+    }
+
+
+def _path_to_file_uri(path_text: str) -> Optional[str]:
+    candidate = (path_text or "").strip()
+    if not candidate:
+        return None
+    try:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = path.resolve()
+        if not path.exists() or not path.is_file():
+            return None
+        return path.as_uri()
+    except Exception:
+        return None
+
+
 def _find_voice_channel_by_name(
     guild: discord.Guild,
     channel_name: str,
@@ -362,6 +571,159 @@ def _baseline_hormone_vector() -> HormoneVector:
     return HormoneVector.from_dict(baseline)
 
 
+def _copy_hormones(vector: HormoneVector) -> HormoneVector:
+    return HormoneVector.from_dict(vector.to_dict())
+
+
+def _hormone_inertia_alpha(intensity: float, sentiment: str) -> float:
+    # Stronger signals move faster, but mood never snaps instantly.
+    scaled_intensity = max(0.0, min(1.25, float(intensity)))
+    alpha = 0.24 + (scaled_intensity * 0.30)
+    if sentiment == "negative":
+        alpha += 0.05
+    return max(0.20, min(0.68, alpha))
+
+
+def _blend_hormone_vectors(previous: HormoneVector, current: HormoneVector, alpha: float) -> HormoneVector:
+    alpha = max(0.0, min(1.0, float(alpha)))
+    prev_dict = previous.to_dict()
+    curr_dict = current.to_dict()
+    blended: dict[str, float] = {}
+    for key, prev_value in prev_dict.items():
+        curr_value = float(curr_dict.get(key, prev_value))
+        blended[key] = max(-1.0, min(1.0, (float(prev_value) * (1.0 - alpha)) + (curr_value * alpha)))
+    return HormoneVector.from_dict(blended)
+
+
+def _generation_policy_from_mood(
+    hormones: HormoneVector,
+    *,
+    is_continuation: bool,
+    direct_question: bool,
+) -> dict[str, object]:
+    pressure = engagement_pressure_from_hormones(hormones, is_continuation=is_continuation)
+    fatigue = (
+        max(0.0, hormones.melatonin) * 0.80
+        + max(0.0, hormones.cortisol) * 0.60
+        + max(0.0, hormones.anxiety) * 0.50
+    )
+    excitement = (
+        max(0.0, hormones.curiosity) * 0.60
+        + max(0.0, hormones.novelty) * 0.50
+        + max(0.0, hormones.dopamine) * 0.40
+        + max(0.0, hormones.endorphin) * 0.30
+    )
+    social = (
+        max(0.0, hormones.oxytocin) * 0.65
+        + max(0.0, hormones.affection) * 0.45
+    )
+
+    temp_multiplier = 1.0 + (pressure * 0.25) + (excitement * 0.10) - (fatigue * 0.22)
+    temp_multiplier = max(0.72, min(1.32, temp_multiplier))
+
+    max_sentences = 3
+    max_chars = 420
+    allow_split = bool(is_continuation and pressure > 0.35 and fatigue < 0.50)
+    style_overrides: dict[str, str] = {}
+
+    if fatigue >= 0.65:
+        max_sentences = 2 if direct_question else 1
+        max_chars = 280 if direct_question else 220
+        allow_split = False
+        style_overrides = {
+            "length": "short",
+            "pacing": "single",
+            "emoji_level": "low",
+            "teasing": "avoid",
+            "tone": "focused",
+            "directness": "high",
+        }
+    elif pressure >= 0.45 and excitement >= 0.45:
+        max_sentences = 4 if direct_question else 3
+        max_chars = 540
+        style_overrides = {
+            "length": "medium",
+            "pacing": "multi" if allow_split else "single",
+            "directness": "medium",
+        }
+        if social >= 0.40:
+            style_overrides["emoji_level"] = "medium"
+
+    return {
+        "pressure": pressure,
+        "temp_multiplier": temp_multiplier,
+        "max_sentences": max_sentences,
+        "max_chars": max_chars,
+        "allow_split": allow_split,
+        "style_overrides": style_overrides,
+    }
+
+
+def _apply_style_policy(style_guidance, policy: dict[str, object]):
+    overrides = policy.get("style_overrides")
+    if not isinstance(overrides, dict):
+        return style_guidance
+    for key in ("tone", "length", "directness", "emoji_level", "teasing", "pacing"):
+        value = overrides.get(key)
+        if isinstance(value, str):
+            setattr(style_guidance, key, value)
+    return style_guidance
+
+
+def _enforce_reply_policy(reply: str, *, max_sentences: int, max_chars: int) -> str:
+    text = (reply or "").strip()
+    if not text:
+        return text
+
+    hard_max_chars = max(80, int(max_chars))
+    limited = text
+    if max_sentences > 0 and "```" not in limited:
+        parts = re.split(r"(?<=[.!?])\s+", limited)
+        parts = [p.strip() for p in parts if p.strip()]
+        if len(parts) > max_sentences:
+            limited = " ".join(parts[:max_sentences]).strip()
+
+    truncated = False
+    if len(limited) > hard_max_chars:
+        limited = limited[:hard_max_chars].rstrip()
+        truncated = True
+    if truncated and limited and limited[-1] not in ".!?":
+        limited = limited.rstrip(" ,;:") + "..."
+    return limited
+
+
+def _feedback_mood_deltas(sentiment: str) -> dict[str, float]:
+    if sentiment == "positive":
+        return {
+            "dopamine": 0.07,
+            "serotonin": 0.05,
+            "oxytocin": 0.07,
+            "endorphin": 0.08,
+            "curiosity": 0.03,
+            "affection": 0.06,
+            "confidence": 0.05,
+            "anxiety": -0.05,
+            "frustration": -0.04,
+            "cortisol": -0.06,
+            "melatonin": -0.02,
+        }
+    if sentiment == "negative":
+        return {
+            "dopamine": -0.07,
+            "serotonin": -0.05,
+            "oxytocin": -0.06,
+            "endorphin": -0.06,
+            "curiosity": -0.02,
+            "affection": -0.06,
+            "confidence": -0.05,
+            "anxiety": 0.07,
+            "frustration": 0.08,
+            "cortisol": 0.08,
+            "melatonin": 0.04,
+        }
+    return {}
+
+
 def _sparkline(values: list[float], min_value: float = -1.0, max_value: float = 1.0) -> str:
     if not values:
         return ""
@@ -409,39 +771,122 @@ def _safe_to_split_reply(text: str) -> bool:
     return True
 
 
-def _split_reply_for_cadence(text: str, max_parts: int = 3) -> list[str]:
+def _split_reply_for_cadence(
+    text: str,
+    *,
+    max_parts: int = 3,
+    min_total_chars: int = 110,
+) -> list[str]:
     cleaned = (text or "").strip()
     if not cleaned:
         return []
     if not _safe_to_split_reply(cleaned):
         return [cleaned]
-    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
-    sentences = [s.strip() for s in sentences if s.strip()]
-    if len(sentences) < 3:
+    if len(cleaned) < max(60, int(min_total_chars)):
         return [cleaned]
-    parts_count = 2 if len(sentences) <= 4 else min(max_parts, 3)
-    total_len = sum(len(s) for s in sentences)
+
+    line_parts = [block.strip() for block in re.split(r"\n{1,}", cleaned) if block.strip()]
+    if len(line_parts) >= 2:
+        segments = line_parts
+    else:
+        sentence_parts = re.split(r"(?<=[.!?])\s+", cleaned)
+        sentence_parts = [s.strip() for s in sentence_parts if s.strip()]
+        if len(sentence_parts) < 2:
+            return [cleaned]
+        segments = sentence_parts
+
+    normalized: list[str] = []
+    for segment in segments:
+        if not normalized:
+            normalized.append(segment)
+            continue
+        if len(segment) < 24:
+            normalized[-1] = f"{normalized[-1]} {segment}".strip()
+        else:
+            normalized.append(segment)
+
+    if len(normalized) < 2:
+        return [cleaned]
+
+    parts_cap = max(2, min(6, int(max_parts)))
+    parts_count = min(parts_cap, len(normalized))
+    total_len = sum(len(s) for s in normalized)
     target_len = max(1, int(total_len / parts_count))
     parts: list[str] = []
     current: list[str] = []
     current_len = 0
-    for sentence in sentences:
-        if current and current_len + len(sentence) > target_len and len(parts) < parts_count - 1:
+    for segment in normalized:
+        if current and current_len + len(segment) > target_len and len(parts) < parts_count - 1:
             parts.append(" ".join(current))
-            current = [sentence]
-            current_len = len(sentence)
+            current = [segment]
+            current_len = len(segment)
         else:
-            current.append(sentence)
-            current_len += len(sentence)
+            current.append(segment)
+            current_len += len(segment)
     if current:
         parts.append(" ".join(current))
-    return parts
+    if len(parts) < 2:
+        return [cleaned]
+    return [part.strip() for part in parts[:parts_cap] if part.strip()]
 
 
-def _followup_delay(chunk: str, hormones: HormoneVector, index: int) -> float:
+def _followup_delay(
+    chunk: str,
+    hormones: HormoneVector,
+    index: int,
+    *,
+    burst_mode: bool = False,
+) -> float:
     base = 0.35 + min(0.8, (len(chunk) / 200.0) * 0.25)
     mood = 0.2 - (hormones.melatonin * 0.2) + (hormones.adrenaline * 0.1) - (hormones.patience * 0.05)
-    return max(0.2, min(1.4, base + mood + (index * 0.05)))
+    delay = max(0.2, min(1.4, base + mood + (index * 0.05)))
+    if burst_mode:
+        delay = max(0.06, min(0.55, delay * 0.5))
+    return delay
+
+
+def _discord_user_style_hint(enabled: bool, *, multi_message_enabled: bool) -> str:
+    if not enabled:
+        return ""
+    if multi_message_enabled:
+        return (
+            "Discord-native style: short casual bursts, natural pacing, minimal formality, "
+            "and occasional quick follow-up lines instead of one dense paragraph."
+        )
+    return (
+        "Discord-native style: concise, casual, and natural, with less formal phrasing."
+    )
+
+
+def _pick_discord_reaction(
+    *,
+    sentiment: str,
+    playful: bool,
+    hormones: HormoneVector,
+) -> Optional[str]:
+    if sentiment == "positive":
+        pool = ["<3", "✨", "🔥", "👍", "🫶", "🙂"]
+    elif sentiment == "negative":
+        pool = ["🫂", "💙", "🙏", "😔"]
+    elif playful or hormones.excitement > 0.45:
+        pool = ["😂", "😄", "✨", "🔥", "🤝"]
+    else:
+        pool = ["👍", "🙂", "🤝"]
+    return random.choice(pool) if pool else None
+
+
+def _extract_direct_agent_reply(context_block: str) -> str:
+    text = (context_block or "").strip()
+    if not text.startswith("[AGENT_DIRECT_REPLY]"):
+        return ""
+    match = re.search(
+        r"\[AGENT_DIRECT_REPLY\]\s*(.*?)\s*\[/AGENT_DIRECT_REPLY\]",
+        text,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return ""
+    return match.group(1).strip()
 
 
 def _format_relative_time(timestamp: dt.datetime) -> str:
@@ -524,6 +969,19 @@ def _attachment_looks_like_image(attachment: discord.Attachment) -> bool:
     if looks_like_image_filename(attachment.filename):
         return True
     return looks_like_image_url(attachment.url)
+
+
+def _attachment_looks_like_video(attachment: discord.Attachment) -> bool:
+    content_type = normalize_content_type(attachment.content_type)
+    if content_type:
+        if content_type.startswith("video/"):
+            return True
+        if content_type == "application/octet-stream":
+            return looks_like_video_filename(attachment.filename) or looks_like_video_url(attachment.url)
+        return False
+    if looks_like_video_filename(attachment.filename):
+        return True
+    return looks_like_video_url(attachment.url)
 
 
 _AUDIO_EXTENSIONS = {
@@ -685,13 +1143,18 @@ class SelDiscordClient(discord.Client):
         hormone_manager=None,  # Optional HormoneStateManager
         **kwargs,
     ):
-        intents = kwargs.pop("intents", discord.Intents.default())
-        intents.message_content = True
-        intents.messages = True
-        intents.reactions = True
-        intents.presences = True  # Enable presence tracking
-        intents.members = True    # Required for presence
-        intents.voice_states = True  # Required for voice channel tracking
+        intents = kwargs.pop("intents", None)
+        if intents is None:
+            if getattr(settings, "discord_full_api_mode_enabled", True):
+                intents = discord.Intents.all()
+            else:
+                intents = discord.Intents.default()
+                intents.message_content = True
+                intents.messages = True
+                intents.reactions = True
+                intents.presences = True
+                intents.members = True
+                intents.voice_states = True
         super().__init__(intents=intents, **kwargs)
 
         self.settings = settings
@@ -710,7 +1173,16 @@ class SelDiscordClient(discord.Client):
             agents_dir=settings.agents_dir,
             data_dir=getattr(settings, "sel_data_dir", "./sel_data"),
         )
+        self.agents_manager = AgentsManager(settings.agents_dir)
+        self._agent_catalog: list[tuple[str, str]] = []
+        self._agent_catalog_last_refresh_ts: float = 0.0
         self.seal_task: Optional[asyncio.Task] = None
+        self.model_dataset_task: Optional[asyncio.Task] = None
+        self.computer_behavior_task: Optional[asyncio.Task] = None
+        self.dream_task: Optional[asyncio.Task] = None
+        self.interoception_task: Optional[asyncio.Task] = None
+        self.status_thought_task: Optional[asyncio.Task] = None
+        self.profile_bio_task: Optional[asyncio.Task] = None
         self.presence_tracker = PresenceTracker()  # Track Discord presence
         self.confidence_scorer = ConfidenceScorer()  # Track response confidence
         self.decay_task: Optional[asyncio.Task] = None
@@ -737,17 +1209,49 @@ class SelDiscordClient(discord.Client):
         # Message batching: collect multiple messages that arrive quickly
         self.pending_messages: dict[int, list[discord.Message]] = {}  # channel_id -> list of messages
         self.batch_timers: dict[int, asyncio.Task] = {}  # channel_id -> timer task
-        self.batch_window_seconds = 2.5  # Wait this long to collect messages before responding
+        self.batch_window_seconds = max(
+            0.2,
+            min(5.0, float(getattr(settings, "discord_batch_window_seconds", 1.0))),
+        )
+        self._status_thought_index: int = 0
+        self._bio_update_supported: Optional[bool] = None
 
         # Spam protection: track message timestamps per user per channel
         self.user_message_timestamps: dict[tuple[int, int], list[float]] = {}  # (channel_id, user_id) -> [timestamps]
 
         # GIF analyzer for understanding animated GIFs
         self.gif_analyzer = GifAnalyzer(max_frames=5, frame_skip=3)
+        # Video analyzer for short video clips (uses ffmpeg)
+        self.video_analyzer = VideoAnalyzer(max_frames=5)
 
         # Global mood/memory IDs (single unified state like a real person)
         self._global_mood_id = settings.global_mood_id if settings.global_mood_enabled else None
         self._global_memory_id = settings.global_memory_id if settings.global_memory_enabled else None
+        self.model_dataset_exporter = SelModelDatasetExporter(settings=settings)
+        self.computer_behavior_analyzer = ComputerBehaviorAnalyzer(settings=settings)
+        self._computer_behavior_profile: dict[str, Any] = {}
+        self._computer_behavior_last_changes: dict[str, dict[str, Any]] = {}
+        self._computer_behavior_last_run_ts: Optional[dt.datetime] = None
+        self._computer_behavior_last_trigger: str = ""
+        self._computer_behavior_failures: int = 0
+        self._computer_behavior_passes: int = 0
+        self._computer_behavior_last_error: str = ""
+        self._computer_behavior_lock = asyncio.Lock()
+        self._dream_lock = asyncio.Lock()
+        self._dream_last_run_ts: Optional[dt.datetime] = None
+        self._dream_last_trigger: str = ""
+        self._dream_last_error: str = ""
+        self._dream_pass_count: int = 0
+        self._dream_fail_count: int = 0
+        self._dream_journal_path = self._resolve_sel_data_path("dream_journal.jsonl")
+        self._dream_latest_path = self._resolve_sel_data_path("latest_dream.md")
+        self.interoception_engine = InteroceptionEngine(settings=settings)
+        self._interoception_lock = asyncio.Lock()
+        self._interoception_latest: dict[str, Any] = {}
+        self._interoception_pass_count: int = 0
+        self._interoception_fail_count: int = 0
+        self._interoception_last_error: str = ""
+        self._interoception_last_run_ts: Optional[dt.datetime] = None
 
         if settings.elevenlabs_api_key and (settings.elevenlabs_tts_enabled or settings.elevenlabs_stt_enabled):
             self.elevenlabs_client = ElevenLabsClient(
@@ -806,6 +1310,413 @@ class SelDiscordClient(discord.Client):
 
     def _is_admin(self, user_id: int) -> bool:
         return _is_authorized(user_id, self.settings.approval_user_id)
+
+    def _get_available_agents(self, *, force: bool = False) -> list[tuple[str, str]]:
+        if not getattr(self.settings, "agent_autonomy_enabled", True):
+            return []
+        safe_agents = list(getattr(self.settings, "agent_autonomy_safe_agents", []))
+        if getattr(self.settings, "sel_operator_mode_enabled", False):
+            operator_agents = [
+                item.strip().lower()
+                for item in getattr(self.settings, "sel_operator_agents", [])
+                if str(item).strip()
+            ]
+            for name in operator_agents:
+                if name not in safe_agents:
+                    safe_agents.append(name)
+
+        refresh_seconds = max(
+            5,
+            int(getattr(self.settings, "agent_autonomy_catalog_refresh_seconds", 60)),
+        )
+        now = time.monotonic()
+        stale = (
+            force
+            or not self._agent_catalog
+            or (now - self._agent_catalog_last_refresh_ts) >= refresh_seconds
+        )
+        if not stale:
+            return list(self._agent_catalog)
+
+        try:
+            loaded_agents = self.agents_manager.list_agents(force_reload=bool(self._agent_catalog) or force)
+        except Exception as exc:
+            logger.warning("Failed to load agents for autonomy: %s", exc)
+            return list(self._agent_catalog)
+
+        catalog: list[tuple[str, str]] = []
+        for agent in loaded_agents:
+            if not agent.name:
+                continue
+            if not is_agent_allowed_for_autonomy(agent.name, safe_agents):
+                continue
+            if not (agent.run or agent.tool):
+                continue
+            description = (agent.description or "").strip() or "No description provided."
+            catalog.append((agent.name, description[:180]))
+
+        catalog.sort(key=lambda item: item[0].lower())
+        self._agent_catalog = catalog
+        self._agent_catalog_last_refresh_ts = now
+        return list(catalog)
+
+    async def _plan_agent_invocation(
+        self,
+        *,
+        clean_content: str,
+        recent_context: str,
+        agents: list[tuple[str, str]],
+    ) -> Optional[AgentPlan]:
+        if not agents:
+            return None
+
+        min_confidence = max(
+            0.0,
+            min(1.0, float(getattr(self.settings, "agent_autonomy_min_confidence", 0.58))),
+        )
+        prompt = build_agent_selection_prompt(
+            user_content=clean_content,
+            recent_context=recent_context,
+            agents=agents,
+        )
+        try:
+            raw = await self.llm_client._chat_completion(
+                model=self.settings.openrouter_util_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            parsed = self.llm_client._parse_json_response(raw)
+        except Exception as exc:
+            logger.debug("Agent planner failed: %s", exc)
+            return None
+
+        return coerce_agent_plan(
+            parsed,
+            allowed_agents=[name for name, _ in agents],
+            min_confidence=min_confidence,
+        )
+
+    def _resolve_sel_data_path(self, filename: str) -> Path:
+        data_dir = Path(getattr(self.settings, "sel_data_dir", "./sel_data")).expanduser()
+        if not data_dir.is_absolute():
+            data_dir = (Path(__file__).resolve().parents[2] / data_dir).resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir / filename
+
+    async def _store_user_memory_background(
+        self,
+        *,
+        memory_id: str,
+        speaker_name: str,
+        channel_name: str,
+        clean_content: str,
+        has_image_attachment: bool,
+        salience: float,
+        use_llm_summary: bool,
+    ) -> None:
+        try:
+            if use_llm_summary:
+                summary = await self.llm_client.summarize_for_memory(
+                    speaker_name,
+                    clean_content or "User sent an attachment.",
+                )
+                if not summary:
+                    return
+            else:
+                raw_content = clean_content
+                if not raw_content:
+                    if has_image_attachment:
+                        raw_content = "User shared images."
+                    else:
+                        raw_content = "User shared an attachment or non-text message."
+                summary = f"[{channel_name}] {speaker_name}: {raw_content}"[:400]
+
+            await self.memory_manager.maybe_store(
+                channel_id=memory_id,
+                summary=summary,
+                tags=["user_message", f"channel:{channel_name}", f"user:{speaker_name}"],
+                salience=salience,
+            )
+            logger.info("Stored memory summary=%s", summary[:80])
+        except Exception as exc:
+            logger.debug("Background memory store failed: %s", exc)
+
+    def _schedule_user_memory_store(self, **kwargs) -> None:
+        task = asyncio.create_task(self._store_user_memory_background(**kwargs))
+        def _consume_exception(done_task: asyncio.Task) -> None:
+            if done_task.cancelled():
+                return
+            try:
+                done_task.exception()
+            except Exception:
+                return
+        task.add_done_callback(_consume_exception)
+
+    def _append_web_behavior_event(self, event: dict[str, Any]) -> None:
+        try:
+            log_path = self._resolve_sel_data_path("web_behavior_log.jsonl")
+            payload = dict(event)
+            payload.setdefault("timestamp_utc", dt.datetime.now(tz=dt.timezone.utc).isoformat())
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        except Exception as exc:
+            logger.debug("Failed to append web behavior event: %s", exc)
+
+    async def _augment_browser_result_with_vision(self, result_text: str) -> str:
+        metadata = _extract_browser_metadata(result_text)
+        if not metadata:
+            return ""
+
+        query_text = str(metadata.get("query", "")).strip()
+        image_urls = list(metadata.get("image_urls", []) or [])
+        screenshot_uri = _path_to_file_uri(str(metadata.get("screenshot_path", "")))
+        targets: list[tuple[str, str]] = []
+        if screenshot_uri:
+            targets.append(("screenshot", screenshot_uri))
+        for image_url in image_urls[:4]:
+            if image_url:
+                targets.append(("image", image_url))
+        if not targets:
+            self._append_web_behavior_event(
+                {
+                    "mode": "vision",
+                    "query": query_text,
+                    "domains": metadata.get("domains", []),
+                    "image_count": len(image_urls),
+                    "vision_used": False,
+                }
+            )
+            return ""
+
+        lines: list[str] = []
+        used = 0
+        for label, target_url in targets[:4]:
+            try:
+                analysis = await self.llm_client.analyze_image(
+                    target_url,
+                    prompt=(
+                        "Describe visible webpage visuals, key objects, text snippets, and any UI/state clues "
+                        "useful for answering a web search query."
+                    ),
+                )
+                caption = render_vision_analysis(analysis).strip()
+                if not caption:
+                    continue
+                used += 1
+                lines.append(f"- {label}: {caption[:320]}")
+            except Exception as exc:
+                logger.debug("Browser vision analysis failed for %s: %s", target_url, exc)
+
+        self._append_web_behavior_event(
+            {
+                "mode": "vision",
+                "query": query_text,
+                "domains": metadata.get("domains", []),
+                "image_count": len(image_urls),
+                "vision_used": bool(lines),
+                "vision_items": used,
+            }
+        )
+        if not lines:
+            return ""
+
+        domain_text = ", ".join(str(x) for x in metadata.get("domains", [])[:6]) or "(none)"
+        return (
+            "[WEB_VISION]\n"
+            f"Domains: {domain_text}\n"
+            f"Detected visuals:\n{chr(10).join(lines)}\n"
+            "[/WEB_VISION]"
+        )
+
+    async def _maybe_run_agent_autonomy(
+        self,
+        *,
+        clean_content: str,
+        recent_context: str,
+        direct_question: bool,
+        continuation_hit: bool,
+        channel_id: str,
+        user_id: str,
+    ) -> Optional[str]:
+        agents = self._get_available_agents()
+        if not agents:
+            return None
+
+        agent_names = [name for name, _ in agents]
+        explicit = match_explicit_agent_request(clean_content, agent_names)
+
+        plan: Optional[AgentPlan] = None
+        if explicit:
+            explicit_agent, explicit_action = explicit
+            plan = AgentPlan(
+                agent=explicit_agent,
+                action=explicit_action,
+                confidence=1.0,
+                reason="explicit_user_request",
+                explicit=True,
+            )
+        else:
+            operator_intent_threshold = max(
+                0.0,
+                min(
+                    1.0,
+                    float(getattr(self.settings, "sel_operator_command_intent_threshold", 0.6)),
+                ),
+            )
+            fast_plan = plan_fast_path_agent_request(
+                clean_content,
+                agent_names=[name for name, _ in agents],
+                direct_question=direct_question,
+                operator_intent_threshold=operator_intent_threshold,
+            )
+            if fast_plan is not None:
+                plan = fast_plan
+            elif should_consider_agent_autonomy(
+                clean_content,
+                direct_question=direct_question,
+                continuation_hit=continuation_hit,
+            ):
+                plan = await self._plan_agent_invocation(
+                    clean_content=clean_content,
+                    recent_context=recent_context,
+                    agents=agents,
+                )
+        if plan is None:
+            return None
+
+        action = (plan.action or clean_content).strip()[:1200]
+        if not action:
+            action = clean_content.strip()[:1200]
+        if not action:
+            return None
+
+        operator_intent_threshold = max(
+            0.0,
+            min(
+                1.0,
+                float(getattr(self.settings, "sel_operator_command_intent_threshold", 0.6)),
+            ),
+        )
+        operator_intent_score: Optional[float] = None
+        if str(plan.agent).strip().lower() == "system_operator":
+            operator_intent_score = score_system_operator_command_intent(
+                clean_content,
+                action=action,
+                reason=plan.reason,
+                explicit=plan.explicit,
+            )
+            if operator_intent_score < operator_intent_threshold:
+                logger.info(
+                    "Skipping system_operator due to low intent score channel=%s score=%.2f threshold=%.2f reason=%s",
+                    channel_id,
+                    operator_intent_score,
+                    operator_intent_threshold,
+                    plan.reason,
+                )
+                return None
+
+        agent_kwargs: dict[str, Any] = {}
+        if str(plan.agent).strip().lower() == "system_operator":
+            agent_kwargs = {
+                "operator_mode_enabled": bool(getattr(self.settings, "sel_operator_mode_enabled", False)),
+                "operator_full_host_privileges": bool(
+                    getattr(self.settings, "sel_operator_full_host_privileges", False)
+                ),
+                "operator_require_approval_user": bool(
+                    getattr(self.settings, "sel_operator_require_approval_user", True)
+                ),
+                "operator_command_timeout_seconds": int(
+                    getattr(self.settings, "sel_operator_command_timeout_seconds", 45)
+                ),
+                "operator_max_output_chars": int(getattr(self.settings, "sel_operator_max_output_chars", 6000)),
+                "operator_block_patterns": list(getattr(self.settings, "sel_operator_block_patterns", []) or []),
+                "operator_data_dir": str(getattr(self.settings, "sel_data_dir", "./sel_data")),
+            }
+            approval_user_id = getattr(self.settings, "approval_user_id", None)
+            if approval_user_id is not None:
+                agent_kwargs["operator_approval_user_id"] = str(approval_user_id)
+
+        try:
+            raw_result = await self.agents_manager.run_agent_async(
+                plan.agent,
+                action,
+                user_id=user_id,
+                channel_id=channel_id,
+                **agent_kwargs,
+            )
+            result_text = str(raw_result).strip()
+        except Exception as exc:
+            result_text = f"Agent execution failed: {exc}"
+
+        if not result_text:
+            result_text = "(agent returned empty output)"
+        if str(plan.agent).strip().lower() == "browser":
+            vision_context = await self._augment_browser_result_with_vision(result_text)
+            if vision_context:
+                result_text = f"{result_text}\n\n{vision_context}"
+        max_result_chars = max(
+            300,
+            int(getattr(self.settings, "agent_autonomy_max_result_chars", 1400)),
+        )
+        if len(result_text) > max_result_chars:
+            result_text = result_text[:max_result_chars].rstrip() + "..."
+
+        action_preview = action[:320]
+        is_operator_command = str(plan.agent).strip().lower() == "system_operator" and is_system_operator_command_intent(
+            clean_content,
+            action=action,
+            reason=plan.reason,
+            explicit=plan.explicit,
+            min_score=operator_intent_threshold,
+        )
+        if is_operator_command:
+            direct_reply_enabled = bool(getattr(self.settings, "sel_operator_direct_reply_enabled", False))
+            if direct_reply_enabled:
+                if operator_intent_score is not None:
+                    logger.info(
+                        "System operator direct reply channel=%s score=%.2f threshold=%.2f",
+                        channel_id,
+                        operator_intent_score,
+                        operator_intent_threshold,
+                    )
+                return f"[AGENT_DIRECT_REPLY]\n{result_text}\n[/AGENT_DIRECT_REPLY]"
+            if operator_intent_score is not None:
+                logger.info(
+                    "System operator conversational reply channel=%s score=%.2f threshold=%.2f",
+                    channel_id,
+                    operator_intent_score,
+                    operator_intent_threshold,
+                )
+            return (
+                "[AGENT_RESULT]\n"
+                f"Agent used: {plan.agent}\n"
+                f"Reason: {plan.reason}\n"
+                f"Action input: {action_preview}\n"
+                f"Result:\n{result_text}\n\n"
+                "React as Sel in first person and make this feel alive/real-time.\n"
+                "Reference the command result directly (do not invent output).\n"
+                "If the terminal output is empty, explicitly say it completed with no terminal output.\n"
+                "[/AGENT_RESULT]"
+            )
+
+        logger.info(
+            "Agent autonomy channel=%s agent=%s explicit=%s confidence=%.2f reason=%s",
+            channel_id,
+            plan.agent,
+            plan.explicit,
+            plan.confidence,
+            plan.reason,
+        )
+
+        return (
+            "[AGENT_RESULT]\n"
+            f"Agent used: {plan.agent}\n"
+            f"Reason: {plan.reason}\n"
+            f"Action input: {action_preview}\n"
+            f"Result:\n{result_text}\n\n"
+            "Integrate this result naturally in your reply. If the result failed, say so briefly and continue.\n"
+            "[/AGENT_RESULT]"
+        )
 
     async def _send_daily_summary(self, channel_id: int) -> None:
         if not self.settings.is_channel_allowed(channel_id):
@@ -1181,11 +2092,688 @@ class SelDiscordClient(discord.Client):
                 except Exception:
                     pass
 
+    async def _export_model_dataset_snapshot(self, *, trigger: str) -> Optional[SelDatasetSnapshot]:
+        try:
+            snapshot = await asyncio.to_thread(
+                self.model_dataset_exporter.create_snapshot,
+                trigger=trigger,
+            )
+            logger.info(
+                "Sel dataset snapshot complete trigger=%s dir=%s files=%d bytes=%d",
+                trigger,
+                snapshot.snapshot_dir,
+                snapshot.files_copied,
+                snapshot.bytes_copied,
+            )
+            return snapshot
+        except Exception as exc:
+            logger.warning("Sel dataset snapshot failed trigger=%s error=%s", trigger, exc)
+            return None
+
+    async def _model_dataset_loop(self) -> None:
+        interval_hours = float(getattr(self.settings, "sel_model_dataset_interval_hours", 12.0))
+        interval_seconds = max(300.0, interval_hours * 3600.0)
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                await self._export_model_dataset_snapshot(trigger="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Model dataset loop error: %s", exc)
+
+    @staticmethod
+    def _combine_style_hints(base_hint: str, behavior_hint: str) -> str:
+        base = (base_hint or "").strip()
+        behavior = (behavior_hint or "").strip()
+        if base and behavior:
+            return f"{base}\n{behavior}"
+        return base or behavior
+
+    def _get_behavior_style_hint(self) -> str:
+        if not getattr(self.settings, "sel_behavior_adaptation_enabled", True):
+            return ""
+        if not self._computer_behavior_profile:
+            return ""
+        try:
+            return self.computer_behavior_analyzer.style_hint(self._computer_behavior_profile)
+        except Exception:
+            return ""
+
+    def _get_behavior_environment_policy(self) -> dict[str, Any]:
+        if not getattr(self.settings, "sel_behavior_adaptation_enabled", True):
+            return {}
+        if not getattr(self.settings, "sel_behavior_full_adaptation", True):
+            return {}
+        if not self._computer_behavior_profile:
+            return {}
+        try:
+            return self.computer_behavior_analyzer.environment_policy(
+                self._computer_behavior_profile,
+                now_utc_hour=dt.datetime.now(tz=dt.timezone.utc).hour,
+            )
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _merge_generation_policy(base: dict[str, Any], env: dict[str, Any]) -> dict[str, Any]:
+        if not env:
+            return base
+
+        merged = dict(base)
+        try:
+            temp_mult = float(base.get("temp_multiplier", 1.0)) * float(env.get("temp_multiplier", 1.0))
+        except Exception:
+            temp_mult = float(base.get("temp_multiplier", 1.0))
+        merged["temp_multiplier"] = _clamp(temp_mult, 0.58, 1.42)
+
+        try:
+            base_chars = int(base.get("max_chars", 420))
+        except Exception:
+            base_chars = 420
+        try:
+            char_mult = float(env.get("max_chars_multiplier", 1.0))
+        except Exception:
+            char_mult = 1.0
+        merged["max_chars"] = max(140, min(980, int(base_chars * char_mult)))
+
+        try:
+            base_sentences = int(base.get("max_sentences", 3))
+        except Exception:
+            base_sentences = 3
+        try:
+            sent_delta = int(env.get("max_sentences_delta", 0))
+        except Exception:
+            sent_delta = 0
+        merged["max_sentences"] = max(1, min(6, base_sentences + sent_delta))
+
+        force_single = bool(env.get("force_single", False))
+        if force_single:
+            merged["allow_split"] = False
+        elif bool(env.get("allow_split_boost", False)):
+            merged["allow_split"] = bool(base.get("allow_split", False)) or True
+
+        style_overrides = base.get("style_overrides", {})
+        if not isinstance(style_overrides, dict):
+            style_overrides = {}
+        merged_style = dict(style_overrides)
+        env_overrides = env.get("style_overrides", {})
+        if isinstance(env_overrides, dict):
+            for key, value in env_overrides.items():
+                if isinstance(value, str):
+                    merged_style[key] = value
+        merged["style_overrides"] = merged_style
+        merged["environment_alignment"] = env.get("alignment")
+        merged["environment_mode"] = env.get("mode")
+        return merged
+
+    @staticmethod
+    def _environment_style_hint(env_policy: dict[str, Any]) -> str:
+        if not env_policy:
+            return ""
+        try:
+            alignment = float(env_policy.get("alignment", 0.5))
+        except Exception:
+            alignment = 0.5
+        alignment = _clamp(alignment, 0.0, 1.0)
+        mode = str(env_policy.get("mode", "")).strip().lower()
+        if alignment <= 0.35:
+            return f"Current environment alignment is low ({alignment:.2f}); keep responses concise and focused."
+        if alignment >= 0.8:
+            return f"Current environment alignment is high ({alignment:.2f}); you can be more expressive and detailed."
+        if mode:
+            return f"Environment rhythm mode: {mode}; keep response pacing consistent with recent usage patterns."
+        return ""
+
+    async def _apply_computer_behavior_profile(
+        self,
+        profile: dict[str, Any],
+        *,
+        trigger: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(profile, dict):
+            profile = {}
+        adaptation_payload = profile.get("adaptation", {})
+        if not isinstance(adaptation_payload, dict):
+            adaptation_payload = {}
+            profile["adaptation"] = adaptation_payload
+        adaptation_payload["full_adaptation"] = bool(
+            getattr(self.settings, "sel_behavior_full_adaptation", True)
+        )
+        self._computer_behavior_profile = profile
+        self._computer_behavior_last_trigger = trigger
+        self._computer_behavior_last_run_ts = dt.datetime.now(tz=dt.timezone.utc)
+
+        if not getattr(self.settings, "sel_behavior_apply_global_tuning", True):
+            self._computer_behavior_last_changes = {}
+            return {}
+
+        if not profile:
+            self._computer_behavior_last_changes = {}
+            return {}
+
+        global_state = await self.state_manager.ensure_global_state()
+        changes = self.computer_behavior_analyzer.apply_global_tuning(global_state, profile)
+        if changes:
+            async with self.state_manager.session() as session:
+                await session.merge(global_state)
+                await session.commit()
+        self._computer_behavior_last_changes = changes
+        return changes
+
+    async def _run_computer_behavior_analysis(self, *, trigger: str) -> Optional[ComputerBehaviorSnapshot]:
+        if not getattr(self.settings, "sel_behavior_adaptation_enabled", True):
+            return None
+
+        async with self._computer_behavior_lock:
+            try:
+                snapshot = await asyncio.to_thread(
+                    self.computer_behavior_analyzer.analyze_and_save,
+                    trigger=trigger,
+                )
+                changes = await self._apply_computer_behavior_profile(
+                    snapshot.profile,
+                    trigger=trigger,
+                )
+                self._computer_behavior_passes += 1
+                self._computer_behavior_last_error = ""
+                logger.info(
+                    "Computer behavior analysis complete trigger=%s profile=%s changes=%s",
+                    trigger,
+                    snapshot.profile_path,
+                    sorted(changes.keys()),
+                )
+                return snapshot
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._computer_behavior_failures += 1
+                self._computer_behavior_last_error = str(exc)
+                self._computer_behavior_last_trigger = trigger
+                self._computer_behavior_last_run_ts = dt.datetime.now(tz=dt.timezone.utc)
+                logger.warning("Computer behavior analysis failed trigger=%s error=%s", trigger, exc)
+                return None
+
+    async def _load_computer_behavior_profile(self) -> None:
+        if not getattr(self.settings, "sel_behavior_adaptation_enabled", True):
+            return
+
+        async with self._computer_behavior_lock:
+            try:
+                profile = await asyncio.to_thread(self.computer_behavior_analyzer.load_profile)
+                if not profile:
+                    return
+                changes = await self._apply_computer_behavior_profile(profile, trigger="startup_load")
+                self._computer_behavior_last_error = ""
+                logger.info(
+                    "Loaded computer behavior profile %s (changes=%s)",
+                    self.computer_behavior_analyzer.profile_path,
+                    sorted(changes.keys()),
+                )
+            except Exception as exc:
+                self._computer_behavior_failures += 1
+                self._computer_behavior_last_error = str(exc)
+                self._computer_behavior_last_trigger = "startup_load"
+                self._computer_behavior_last_run_ts = dt.datetime.now(tz=dt.timezone.utc)
+                logger.warning("Failed to load computer behavior profile: %s", exc)
+
+    async def _computer_behavior_loop(self) -> None:
+        interval_hours = float(getattr(self.settings, "sel_behavior_interval_hours", 8.0))
+        interval_seconds = max(1800.0, interval_hours * 3600.0)
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                await self._run_computer_behavior_analysis(trigger="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Computer behavior loop error: %s", exc)
+
+    async def _dream_loop(self) -> None:
+        interval_minutes = float(getattr(self.settings, "sel_dream_interval_minutes", 90.0))
+        interval_seconds = max(900.0, interval_minutes * 60.0)
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                await self._run_dream_cycle(trigger="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Dream loop error: %s", exc)
+
+    async def _dream_sleep_context(self) -> tuple[Optional[float], Optional[str], int]:
+        await self._ensure_biological_state_loaded()
+        now_utc = dt.datetime.now(tz=dt.timezone.utc)
+
+        try:
+            tz = zoneinfo.ZoneInfo(self.settings.timezone_name)
+            local_hour = dt.datetime.now(tz).hour
+        except Exception:
+            local_hour = now_utc.hour
+
+        async with self._bio_lock:
+            last_activity_ts = self.biological_state.last_activity_ts
+            last_activity_channel_id = self.biological_state.last_activity_channel_id
+            if last_activity_ts and last_activity_ts.tzinfo is None:
+                last_activity_ts = last_activity_ts.replace(tzinfo=dt.timezone.utc)
+                self.biological_state.last_activity_ts = last_activity_ts
+
+        if last_activity_ts:
+            inactive_hours = (now_utc - last_activity_ts).total_seconds() / 3600.0
+        else:
+            inactive_hours = None
+        return inactive_hours, last_activity_channel_id, local_hour
+
+    def _should_run_dream_cycle(
+        self,
+        *,
+        trigger: str,
+        inactive_hours: Optional[float],
+        local_hour: int,
+    ) -> bool:
+        if trigger.startswith("manual") or trigger == "startup":
+            return True
+
+        min_inactive = max(0.25, float(getattr(self.settings, "sel_dream_min_inactive_hours", 1.5)))
+        if inactive_hours is None or inactive_hours < min_inactive:
+            return False
+
+        sleep_hours = local_hour >= 22 or local_hour < 8
+        return sleep_hours or inactive_hours >= max(4.0, min_inactive + 2.0)
+
+    async def _apply_dream_cleanup_to_mood(self, mood_id: str, cleanup_deltas: dict[str, float]) -> None:
+        if not cleanup_deltas:
+            return
+
+        if self.hormone_manager:
+            cached = await self.hormone_manager.get_state(mood_id)
+            before = _copy_hormones(cached.vector)
+            nudged = _copy_hormones(cached.vector).apply(cleanup_deltas)
+            persisted = _blend_hormone_vectors(before, nudged, 0.34)
+            await self.hormone_manager.update_state(
+                mood_id,
+                persisted,
+                focus_topic=cached.focus_topic,
+                energy_level=cached.energy_level,
+                messages_since_response=cached.messages_since_response,
+                last_response_ts=cached.last_response_ts,
+            )
+            return
+
+        channel_state = await self.state_manager.get_channel_state(mood_id)
+        before = HormoneVector.from_channel(channel_state)
+        nudged = _copy_hormones(before).apply(cleanup_deltas)
+        persisted = _blend_hormone_vectors(before, nudged, 0.34)
+        persisted.to_channel(channel_state)
+        await self.state_manager.update_channel_state(channel_state)
+
+    async def _run_dream_cycle(self, *, trigger: str) -> Optional[dict[str, Any]]:
+        if (not getattr(self.settings, "sel_dream_enabled", True)) and not trigger.startswith("manual"):
+            return None
+
+        async with self._dream_lock:
+            now_utc = dt.datetime.now(tz=dt.timezone.utc)
+            self._dream_last_trigger = trigger
+            self._dream_last_run_ts = now_utc
+            try:
+                inactive_hours, last_channel_id, local_hour = await self._dream_sleep_context()
+                if not self._should_run_dream_cycle(
+                    trigger=trigger,
+                    inactive_hours=inactive_hours,
+                    local_hour=local_hour,
+                ):
+                    return None
+
+                memory_id = self._global_memory_id or last_channel_id or "sel_dream"
+                mood_source = last_channel_id or "sel_dream"
+                mood_id = self._get_mood_id(mood_source)
+                memory_limit = max(8, int(getattr(self.settings, "sel_dream_memory_limit", 32)))
+                recent_memories = await self.memory_manager.retrieve_recent(memory_id, limit=memory_limit)
+                emotional_signal = aggregate_emotional_signal(recent_memories, limit=memory_limit)
+
+                payload_raw: Any = None
+                try:
+                    memory_lines = []
+                    for mem in recent_memories[: memory_limit]:
+                        summary = str(getattr(mem, "summary", "") or "").strip()
+                        if not summary:
+                            continue
+                        salience = _clamp(float(getattr(mem, "salience", 0.5) or 0.5), 0.0, 1.0)
+                        memory_lines.append(f"- ({salience:.2f}) {summary[:240]}")
+                    memory_block = "\n".join(memory_lines) if memory_lines else "- (no recent memories)"
+                    signal_json = json.dumps(emotional_signal, sort_keys=True, ensure_ascii=True)
+                    prompt = (
+                        "You are Sel's sleep-phase dream subsystem.\n"
+                        "Synthesize a realistic dream pass that processes emotions, consolidates memory, and clears mental clutter.\n"
+                        "Model it as replay that keeps old knowledge while integrating new traces (intersection of old/new manifolds).\n"
+                        "Return strict JSON only with this schema:\n"
+                        "{"
+                        "\"title\": str, "
+                        "\"narrative\": str, "
+                        "\"emotional_processing\": [str], "
+                        "\"consolidated_memories\": [str], "
+                        "\"clutter_release\": [str], "
+                        "\"replay_focus\": [str], "
+                        "\"mood_delta_suggestions\": {str: number}"
+                        "}\n\n"
+                        f"trigger={trigger}\n"
+                        f"inactive_hours={inactive_hours}\n"
+                        f"recent_memory_count={len(recent_memories)}\n"
+                        f"emotional_signal={signal_json}\n"
+                        "recent_memories:\n"
+                        f"{memory_block}\n"
+                    )
+                    raw = await self.llm_client._chat_completion(
+                        model=self.settings.openrouter_util_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.45,
+                    )
+                    payload_raw = self.llm_client._parse_json_response(raw)
+                except Exception as exc:
+                    logger.debug("Dream LLM synthesis fallback trigger=%s error=%s", trigger, exc)
+
+                dream_payload = coerce_dream_payload(
+                    payload_raw,
+                    memories=recent_memories,
+                    emotional_signal=emotional_signal,
+                    trigger=trigger,
+                    timestamp=now_utc,
+                )
+                cleanup_raw = dream_payload.get("mood_delta_suggestions", {})
+                cleanup_deltas: dict[str, float] = {}
+                if isinstance(cleanup_raw, dict):
+                    for key, value in cleanup_raw.items():
+                        name = str(key).strip()
+                        if not name:
+                            continue
+                        try:
+                            cleanup_deltas[name] = _clamp(float(value), -0.2, 0.2)
+                        except Exception:
+                            continue
+
+                await self._apply_dream_cleanup_to_mood(mood_id, cleanup_deltas)
+
+                tags = ["dream", "consolidated", "offline_replay", f"trigger:{trigger}"]
+                for index, item in enumerate(dream_payload.get("consolidated_memories", [])[:4]):
+                    summary = f"[Dream] {str(item).strip()}"[:420]
+                    if not summary.strip():
+                        continue
+                    salience = _clamp(0.62 - (index * 0.05), 0.42, 0.78)
+                    await self.memory_manager.maybe_store(
+                        channel_id=memory_id,
+                        summary=summary,
+                        tags=tags,
+                        salience=salience,
+                    )
+
+                dream_narrative = str(dream_payload.get("narrative", "") or "").strip()
+                if dream_narrative:
+                    narrative_summary = f"[Dream Narrative] {dream_payload.get('title', 'Dream')}: {dream_narrative}"[:450]
+                    await self.memory_manager.maybe_store(
+                        channel_id=memory_id,
+                        summary=narrative_summary,
+                        tags=["dream", "narrative", f"trigger:{trigger}"],
+                        salience=0.55,
+                    )
+
+                global_state = await self._ensure_biological_state_loaded()
+                async with self._bio_lock:
+                    self.biological_state.dreams.last_dream_time = now_utc
+                    self.biological_state.dreams.dreams_processed += 1
+                    self.biological_state.dreams.emotional_residue = dict(emotional_signal)
+                    self._bio_dirty = True
+                async with self.state_manager.session() as session:
+                    global_state.biological_state = self.biological_state.to_dict()
+                    self._bio_dirty = False
+                    await session.merge(global_state)
+                    await session.commit()
+
+                entry: dict[str, Any] = {
+                    "timestamp_utc": now_utc.isoformat(),
+                    "trigger": trigger,
+                    "memory_id": memory_id,
+                    "mood_id": mood_id,
+                    "hours_inactive": round(float(inactive_hours), 3) if inactive_hours is not None else None,
+                    "memory_count": len(recent_memories),
+                    "emotion_signal": emotional_signal,
+                    "cleanup_deltas": cleanup_deltas,
+                    "dream": dream_payload,
+                }
+                with self._dream_journal_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+                max_entries = max(50, int(getattr(self.settings, "sel_dream_max_journal_entries", 400)))
+                trim_jsonl_file(self._dream_journal_path, max_entries=max_entries)
+                self._dream_latest_path.write_text(render_dream_markdown(entry), encoding="utf-8")
+
+                self._dream_pass_count += 1
+                self._dream_last_error = ""
+                logger.info(
+                    "Dream cycle complete trigger=%s memories=%s cleanup=%s",
+                    trigger,
+                    len(recent_memories),
+                    sorted(cleanup_deltas.keys()),
+                )
+                return entry
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._dream_fail_count += 1
+                self._dream_last_error = str(exc)
+                logger.warning("Dream cycle failed trigger=%s error=%s", trigger, exc)
+                return None
+
+    async def _reference_hormones_for_interoception(
+        self,
+        *,
+        preferred_channel_id: Optional[str] = None,
+    ) -> HormoneVector:
+        mood_id = self._get_mood_id(preferred_channel_id or "interoception")
+        if self.hormone_manager:
+            cached = await self.hormone_manager.get_state(mood_id)
+            return _copy_hormones(cached.vector)
+        channel_state = await self.state_manager.get_channel_state(mood_id)
+        return HormoneVector.from_channel(channel_state)
+
+    async def _refresh_interoception_snapshot(
+        self,
+        *,
+        trigger: str,
+        hormones: Optional[HormoneVector] = None,
+        preferred_channel_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        if not getattr(self.settings, "sel_interoception_enabled", True):
+            return None
+        async with self._interoception_lock:
+            self._interoception_last_run_ts = dt.datetime.now(tz=dt.timezone.utc)
+            try:
+                await self._ensure_biological_state_loaded()
+                if hormones is None:
+                    hormones = await self._reference_hormones_for_interoception(
+                        preferred_channel_id=preferred_channel_id,
+                    )
+                try:
+                    tz = zoneinfo.ZoneInfo(self.settings.timezone_name)
+                    local_hour = dt.datetime.now(tz).hour
+                except Exception:
+                    local_hour = dt.datetime.now(tz=dt.timezone.utc).hour
+
+                env_policy = self._get_behavior_environment_policy()
+                env_alignment = _clamp(float(env_policy.get("alignment", 0.5))) if env_policy else 0.5
+                sensor_payload = self.interoception_engine.read_latest_sensor_payload()
+                snapshot = self.interoception_engine.compute_snapshot(
+                    bio_state=self.biological_state,
+                    hormones=hormones,
+                    trigger=trigger,
+                    local_hour=local_hour,
+                    environment_alignment=env_alignment,
+                    sensor_payload=sensor_payload,
+                )
+                max_entries = max(200, int(getattr(self.settings, "sel_interoception_max_log_entries", 4000)))
+                self.interoception_engine.persist_snapshot(snapshot, max_entries=max_entries)
+                self._interoception_latest = snapshot
+                self._interoception_pass_count += 1
+                self._interoception_last_error = ""
+                return snapshot
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._interoception_fail_count += 1
+                self._interoception_last_error = str(exc)
+                logger.warning("Interoception snapshot failed trigger=%s error=%s", trigger, exc)
+                return None
+
+    async def _interoception_loop(self) -> None:
+        interval_seconds = max(20, int(getattr(self.settings, "sel_interoception_interval_seconds", 120)))
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                await self._refresh_interoception_snapshot(trigger="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("Interoception loop error: %s", exc)
+
+    def _interoception_style_hint(self) -> str:
+        if not self._interoception_latest:
+            return ""
+        metrics = self._interoception_latest.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        mode = str(self._interoception_latest.get("mode", "")).strip().lower()
+        stress = _clamp(float(metrics.get("stress_load", 0.0) or 0.0))
+        fatigue = _clamp(float(metrics.get("fatigue", 0.0) or 0.0))
+        cognitive = _clamp(float(metrics.get("cognitive_load", 0.0) or 0.0))
+        social_need = _clamp(float(metrics.get("social_need", 0.0) or 0.0))
+        if mode in {"overloaded", "strained"} or stress >= 0.72:
+            return "Synthetic interoception indicates overload; keep responses short, precise, and calm."
+        if mode == "drowsy" or fatigue >= 0.72:
+            return "Synthetic interoception indicates high sleep pressure; keep response pacing slower and concise."
+        if social_need >= 0.7 and stress < 0.6:
+            return "Synthetic interoception indicates elevated social need; allow slightly warmer engagement."
+        if cognitive >= 0.7:
+            return "Synthetic interoception indicates high cognitive load; avoid rambling and focus on essentials."
+        return ""
+
+    def _next_status_thought(self) -> str:
+        configured = [
+            str(item).strip()
+            for item in getattr(self.settings, "sel_status_thoughts", [])
+            if str(item).strip()
+        ]
+        mode = str(self._interoception_latest.get("mode", "")).strip().lower() if self._interoception_latest else ""
+        if mode:
+            configured.append(f"mode: {mode}")
+        if not configured:
+            configured = ["watching chat rhythms"]
+        index = self._status_thought_index % len(configured)
+        self._status_thought_index += 1
+        return configured[index][:96]
+
+    async def _set_presence_thought(self, *, trigger: str) -> None:
+        thought = self._next_status_thought()
+        try:
+            activity = discord.CustomActivity(name=thought)
+            await self.change_presence(status=discord.Status.online, activity=activity)
+            logger.info("Updated Discord presence thought trigger=%s thought=%s", trigger, thought)
+        except Exception:
+            try:
+                activity = discord.Activity(type=discord.ActivityType.listening, name=thought)
+                await self.change_presence(status=discord.Status.online, activity=activity)
+                logger.info("Updated Discord activity fallback trigger=%s thought=%s", trigger, thought)
+            except Exception as exc:
+                logger.debug("Failed to update presence thought trigger=%s error=%s", trigger, exc)
+
+    async def _status_thought_loop(self) -> None:
+        await self.wait_until_ready()
+        interval = max(30, int(getattr(self.settings, "sel_status_thoughts_interval_seconds", 240)))
+        while not self.is_closed():
+            try:
+                await self._set_presence_thought(trigger="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Status thought loop error: %s", exc)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+
+    def _compose_profile_bio(self) -> str:
+        mode = str(self._interoception_latest.get("mode", "balanced")) if self._interoception_latest else "balanced"
+        thought = self._next_status_thought()
+        return (
+            f"Sel | adaptive Discord mind | mode: {mode} | "
+            f"memory+dreaming+interoception | {thought}"
+        )[:190]
+
+    async def _update_profile_bio_once(self, *, trigger: str) -> None:
+        # Always persist local runtime bio, even if Discord API doesn't support bot bio edits.
+        bio_text = self._compose_profile_bio()
+        try:
+            bio_path = self._resolve_sel_data_path("discord_runtime_bio.txt")
+            bio_path.write_text(bio_text + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+        if self._bio_update_supported is False:
+            return
+        if not self.user:
+            return
+        edit = getattr(self.user, "edit", None)
+        if not callable(edit):
+            self._bio_update_supported = False
+            return
+        try:
+            await edit(bio=bio_text)
+            self._bio_update_supported = True
+            logger.info("Updated Discord bot bio trigger=%s", trigger)
+        except TypeError:
+            # Most bot tokens cannot edit profile bio at runtime via API.
+            self._bio_update_supported = False
+            logger.info("Discord bot bio updates not supported by current API/runtime.")
+        except Exception as exc:
+            logger.debug("Discord bot bio update failed trigger=%s error=%s", trigger, exc)
+
+    async def _profile_bio_loop(self) -> None:
+        await self.wait_until_ready()
+        interval = max(300, int(getattr(self.settings, "sel_profile_bio_interval_seconds", 1800)))
+        while not self.is_closed():
+            try:
+                await self._update_profile_bio_once(trigger="scheduled")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Profile bio loop error: %s", exc)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+
     async def setup_hook(self) -> None:
         self.decay_task = asyncio.create_task(self._decay_loop())
         self.ping_task = asyncio.create_task(self._inactive_ping_loop())
         if self.settings.seal_enabled:
             self.seal_task = asyncio.create_task(self.seal_editor.run_loop())
+        if getattr(self.settings, "sel_model_dataset_auto_export_enabled", True):
+            self.model_dataset_task = asyncio.create_task(self._model_dataset_loop())
+        if getattr(self.settings, "sel_model_dataset_export_on_start", True):
+            asyncio.create_task(self._export_model_dataset_snapshot(trigger="startup"))
+        if getattr(self.settings, "sel_behavior_adaptation_enabled", True):
+            await self._load_computer_behavior_profile()
+            self.computer_behavior_task = asyncio.create_task(self._computer_behavior_loop())
+            if getattr(self.settings, "sel_behavior_analyze_on_start", True):
+                asyncio.create_task(self._run_computer_behavior_analysis(trigger="startup"))
+        if getattr(self.settings, "sel_interoception_enabled", True):
+            self.interoception_task = asyncio.create_task(self._interoception_loop())
+            asyncio.create_task(self._refresh_interoception_snapshot(trigger="startup"))
+        if getattr(self.settings, "sel_dream_enabled", True):
+            self.dream_task = asyncio.create_task(self._dream_loop())
+            if getattr(self.settings, "sel_dream_on_start", True):
+                asyncio.create_task(self._run_dream_cycle(trigger="startup"))
+        if getattr(self.settings, "sel_status_thoughts_enabled", True):
+            self.status_thought_task = asyncio.create_task(self._status_thought_loop())
+        if getattr(self.settings, "sel_profile_bio_updates_enabled", True):
+            self.profile_bio_task = asyncio.create_task(self._profile_bio_loop())
         self.daily_summary_task = asyncio.create_task(self._daily_summary_loop())
         self.checkin_task = asyncio.create_task(self._scheduled_checkin_loop())
         if self.settings.voice_auto_leave_enabled:
@@ -1197,6 +2785,13 @@ class SelDiscordClient(discord.Client):
         ):
             self._tts_task = asyncio.create_task(self._tts_loop())
         self.tree.add_command(app_commands.Command(name="sel_status", description="Show Sel's mood and channel state", callback=self._cmd_status))
+        self.tree.add_command(app_commands.Command(name="sel_agents", description="Show autonomous agent allowlist and loaded agents", callback=self._cmd_agents))
+        self.tree.add_command(app_commands.Command(name="sel_seal", description="Show SEAL self-edit status and scores", callback=self._cmd_seal))
+        self.tree.add_command(app_commands.Command(name="sel_behavior", description="Show computer-behavior adaptation status (admin only)", callback=self._cmd_behavior))
+        self.tree.add_command(app_commands.Command(name="sel_interoception", description="Show synthetic interoception status (admin only)", callback=self._cmd_interoception))
+        self.tree.add_command(app_commands.Command(name="sel_operator", description="Run/status host operator mode (admin only)", callback=self._cmd_operator))
+        self.tree.add_command(app_commands.Command(name="sel_dream", description="Show or trigger dream consolidation (admin only)", callback=self._cmd_dream))
+        self.tree.add_command(app_commands.Command(name="sel_export_data", description="Export Sel model dataset snapshot (admin only)", callback=self._cmd_export_data))
         self.tree.add_command(app_commands.Command(name="sel_improve", description="Queue self-improvement suggestions", callback=self._cmd_improve))
         self.tree.add_command(app_commands.Command(name="him_status", description="Check HIM API connectivity", callback=self._cmd_him_status))
         self.tree.add_command(app_commands.Command(name="sel_cache_stats", description="Show LLM response cache statistics", callback=self._cmd_cache_stats))
@@ -1222,6 +2817,18 @@ class SelDiscordClient(discord.Client):
             self.ping_task.cancel()
         if self.seal_task:
             self.seal_task.cancel()
+        if self.model_dataset_task:
+            self.model_dataset_task.cancel()
+        if self.computer_behavior_task:
+            self.computer_behavior_task.cancel()
+        if self.interoception_task:
+            self.interoception_task.cancel()
+        if self.dream_task:
+            self.dream_task.cancel()
+        if self.status_thought_task:
+            self.status_thought_task.cancel()
+        if self.profile_bio_task:
+            self.profile_bio_task.cancel()
         if self.daily_summary_task:
             self.daily_summary_task.cancel()
         if self.checkin_task:
@@ -1401,7 +3008,7 @@ class SelDiscordClient(discord.Client):
 
                     # Global personality drift (still uses state_manager)
                     async with self.state_manager.session() as session:
-                        g_state = (await session.execute(select(GlobalSelState))).scalar_one_or_none()
+                        g_state = await _load_single_global_state(session)
                         if g_state:
                             if self.hormone_manager._cache:
                                 # Average dopamine across all cached channels
@@ -1463,7 +3070,7 @@ class SelDiscordClient(discord.Client):
                                 self.biological_state.daily_cortisol_sum += avg_cortisol_sum / avg_cortisol_count
                                 self.biological_state.daily_cortisol_samples += 1
                                 self._bio_dirty = True
-                        g_state = (await session.execute(select(GlobalSelState))).scalar_one_or_none()
+                        g_state = await _load_single_global_state(session)
                         if g_state:
                             # personality drift slightly toward calmer if low cortisol, more playful with novelty
                             drift = max(0.0, min(0.01, sum(s.dopamine for s in channels) / (len(channels) + 1)))
@@ -1582,6 +3189,10 @@ class SelDiscordClient(discord.Client):
             user_state.user_id,
         )
 
+        behavior_style_hint = self._combine_style_hints(
+            self._get_behavior_style_hint(),
+            self._environment_style_hint(self._get_behavior_environment_policy()),
+        )
         system_messages = build_messages(
             global_state=global_state,
             channel_state=channel_state,
@@ -1593,6 +3204,7 @@ class SelDiscordClient(discord.Client):
             available_emojis=emoji_block,
             image_descriptions=None,
             local_time=None,
+            style_hint=behavior_style_hint or None,
         )
         try:
             hormones = HormoneVector.from_channel(channel_state)
@@ -1628,11 +3240,28 @@ class SelDiscordClient(discord.Client):
 
     async def on_ready(self):
         logger.info("Sel connected as %s", self.user)
+        logger.info(
+            "Discord intents mode: %s",
+            "full" if getattr(self.settings, "discord_full_api_mode_enabled", True) else "custom",
+        )
+        if getattr(self.settings, "discord_full_api_mode_enabled", True):
+            logger.info(
+                "Full API mode needs Discord Developer Portal privileged intents enabled "
+                "(Members, Presence, Message Content) and bot role permissions in each guild."
+            )
         try:
-            activity = discord.Activity(type=discord.ActivityType.listening, name="for quiet friends")
-            await self.change_presence(status=discord.Status.online, activity=activity)
+            if getattr(self.settings, "sel_status_thoughts_enabled", True):
+                await self._set_presence_thought(trigger="ready")
+            else:
+                activity = discord.Activity(type=discord.ActivityType.listening, name="for quiet friends")
+                await self.change_presence(status=discord.Status.online, activity=activity)
         except Exception as exc:
             logger.warning("Failed to update Sel presence: %s", exc)
+        if getattr(self.settings, "sel_profile_bio_updates_enabled", True):
+            try:
+                await self._update_profile_bio_once(trigger="ready")
+            except Exception:
+                pass
 
         # Initialize presence tracking for all guilds
         for guild in self.guilds:
@@ -1874,6 +3503,14 @@ class SelDiscordClient(discord.Client):
 
         original_content = (message.content or "").strip()
         clean_content = (user_content_override or original_content).strip()
+        fast_mode_enabled = bool(getattr(self.settings, "response_fast_mode_enabled", True))
+        try:
+            fast_classify_chars = max(
+                30,
+                int(getattr(self.settings, "response_fast_mode_skip_classification_chars", 90)),
+            )
+        except Exception:
+            fast_classify_chars = 90
 
         audio_transcripts: list[str] = []
         if self.settings.elevenlabs_stt_enabled and self.elevenlabs_client:
@@ -1916,23 +3553,33 @@ class SelDiscordClient(discord.Client):
         # Track if the user replied directly to Sel (even without a mention)
         is_reply_to_sel = False
         is_reply_to_other = False
+        referenced_message = None  # the message being replied to, if any
         if message.reference:
             resolved = message.reference.resolved or getattr(message.reference, "cached_message", None)
             if resolved and resolved.author and self.user and resolved.author.id == self.user.id:
                 is_reply_to_sel = True
+                referenced_message = resolved
             elif resolved and resolved.author:
                 is_reply_to_other = True
+                referenced_message = resolved
             elif message.reference.message_id and self.user:
                 try:
                     ref_msg = await message.channel.fetch_message(message.reference.message_id)
                     is_reply_to_sel = ref_msg.author.id == self.user.id
                     if not is_reply_to_sel:
                         is_reply_to_other = True
+                    referenced_message = ref_msg
                 except Exception:
                     pass
 
         # Classify message and update hormones
-        classification = await self.llm_client.classify_message(clean_content or "")
+        classification = (
+            _quick_classify_message(clean_content or "", max_chars=fast_classify_chars)
+            if fast_mode_enabled
+            else None
+        )
+        if classification is None:
+            classification = await self.llm_client.classify_message(clean_content or "")
         sentiment = str(classification.get("sentiment", "neutral"))
         intensity = float(classification.get("intensity", 0.3) or 0.3)
         playful = bool(classification.get("playful", False))
@@ -1962,7 +3609,7 @@ class SelDiscordClient(discord.Client):
             # HIM-based hormone storage (global mood = same state for all channels)
             mood_id = self._get_mood_id(str(message.channel.id))
             cached = await self.hormone_manager.get_state(mood_id)
-            pre_hormones = cached.vector
+            pre_hormones = _copy_hormones(cached.vector)
             logger.info(
                 "Classification channel=%s sentiment=%s intensity=%s playful=%s memory=%s state_before=%s",
                 message.channel.id,
@@ -1975,13 +3622,15 @@ class SelDiscordClient(discord.Client):
 
             # Apply message effects to hormone vector
             hormones = apply_message_effects(
-                cached.vector,
+                _copy_hormones(cached.vector),
                 sentiment=sentiment,
                 intensity=intensity,
                 playful=playful,
             )
             if bio_effects or goal_effects:
                 hormones.apply(_merge_effects(bio_effects, goal_effects))
+            inertia_alpha = _hormone_inertia_alpha(intensity, sentiment)
+            hormones = _blend_hormone_vectors(pre_hormones, hormones, inertia_alpha)
 
             # Update HormoneStateManager cache (global mood)
             await self.hormone_manager.update_state(
@@ -2009,7 +3658,7 @@ class SelDiscordClient(discord.Client):
                 classification.get("memory_write"),
                 pre_hormones.natural_language_summary(),
             )
-            hormones = HormoneVector.from_channel(channel_state)
+            hormones = _copy_hormones(pre_hormones)
             hormones = apply_message_effects(
                 hormones,
                 sentiment=sentiment,
@@ -2018,6 +3667,8 @@ class SelDiscordClient(discord.Client):
             )
             if bio_effects or goal_effects:
                 hormones.apply(_merge_effects(bio_effects, goal_effects))
+            inertia_alpha = _hormone_inertia_alpha(intensity, sentiment)
+            hormones = _blend_hormone_vectors(pre_hormones, hormones, inertia_alpha)
             hormones.to_channel(channel_state)
             await self.state_manager.update_channel_state(channel_state)
             logger.info(
@@ -2053,34 +3704,24 @@ class SelDiscordClient(discord.Client):
                 delta=global_delta,
             )
 
-        # Optionally write memory (global memory = SEL remembers across ALL channels)
+        # Optionally write memory (global memory = SEL remembers across ALL channels).
+        # Run asynchronously so memory summarization/embedding work does not block reply latency.
         if classification.get("memory_write") or len(clean_content.strip()) >= 20:
-            channel_name = getattr(message.channel, 'name', 'DM')
-            if self.settings.memory_summarize_enabled:
-                summary = await self.llm_client.summarize_for_memory(
-                    message.author.display_name,
-                    clean_content or "User sent an attachment.",
-                )
-                if not summary:
-                    summary = None  # SKIP — don't store trivial message
-            else:
-                raw_content = clean_content
-                if not raw_content:
-                    if has_image_attachment:
-                        raw_content = "User shared images."
-                    else:
-                        raw_content = "User shared an attachment or non-text message."
-                summary = f"[{channel_name}] {message.author.display_name}: {raw_content}"[:400]
-            if summary:
-                salience = float(classification.get("intensity", 0.5))
-                memory_id = self._get_memory_id(str(message.channel.id))
-                await self.memory_manager.maybe_store(
-                    channel_id=memory_id,
-                    summary=summary,
-                    tags=["user_message", f"channel:{channel_name}", f"user:{message.author.display_name}"],
-                    salience=salience,
-                )
-                logger.info("Stored memory summary=%s", summary[:80])
+            channel_name = getattr(message.channel, "name", "DM")
+            salience = float(classification.get("intensity", 0.5))
+            memory_id = self._get_memory_id(str(message.channel.id))
+            use_llm_summary = bool(self.settings.memory_summarize_enabled) and not (
+                fast_mode_enabled and len(clean_content) <= fast_classify_chars
+            )
+            self._schedule_user_memory_store(
+                memory_id=memory_id,
+                speaker_name=message.author.display_name,
+                channel_name=channel_name,
+                clean_content=clean_content,
+                has_image_attachment=has_image_attachment,
+                salience=salience,
+                use_llm_summary=use_llm_summary,
+            )
 
         bot_name = self.user.name if self.user else "sel"
         name_called = _name_called(lower_content, bot_name)
@@ -2115,10 +3756,12 @@ class SelDiscordClient(discord.Client):
             if getattr(global_state, "continuation_keywords", None)
             else self.settings.continuation_keywords
         )
-        continuation_hit = any(kw in lower_content for kw in continuation_keywords)
+        continuation_hit = (message.guild is None) and any(kw in lower_content for kw in continuation_keywords)
         recent_followup = (
+            message.guild is None
+            and
             seconds_since_response is not None
-            and seconds_since_response < 360
+            and seconds_since_response < 120
             and (
                 " you" in lower_content
                 or lower_content.startswith("you ")
@@ -2133,17 +3776,7 @@ class SelDiscordClient(discord.Client):
             direct_question = direct_question or "?" in clean_content
         if addressed_to_sel:
             continuation_hit = True
-
-        style_guidance = derive_style_guidance(
-            global_state=global_state,
-            user_state=user_state,
-            sentiment=str(classification.get("sentiment", "neutral")),
-            intensity=float(classification.get("intensity", 0.3) or 0.3),
-            playful=bool(classification.get("playful", False)),
-            user_content=clean_content,
-            direct_question=direct_question,
-        )
-        style_hint = format_style_hint(style_guidance)
+        style_hint = ""
 
         # Check for voice channel commands
         command_text = lower_content.strip()
@@ -2259,6 +3892,9 @@ class SelDiscordClient(discord.Client):
         recent_msgs = []
         recent_sel_openers: list[str] = []
         speaker_counts: Counter[str] = Counter()
+        recent_other_names: set[str] = set()
+        recent_sel_messages = 0
+        recent_author_messages = 0
         history_limit = max(8, self.settings.recent_context_limit)
         try:
             async for msg in message.channel.history(limit=history_limit, oldest_first=False):
@@ -2266,22 +3902,64 @@ class SelDiscordClient(discord.Client):
                     continue
                 if msg.author.bot and msg.author != self.user:
                     continue
+                msg_ts = msg.created_at
+                if msg_ts.tzinfo is None:
+                    msg_ts = msg_ts.replace(tzinfo=dt.timezone.utc)
+                msg_is_recent = (now - msg_ts).total_seconds() <= 900
                 snippet = (msg.content or "").strip()
                 if snippet:
                     marker = "->" if msg.reference or (msg.mentions and self.user in msg.mentions) else ""
                     time_str = _format_relative_time(msg.created_at)
                     recent_msgs.append(f"[{time_str}] {msg.author.display_name}{marker}: {snippet}")
                     if self.user and msg.author.id == self.user.id:
+                        if msg_is_recent:
+                            recent_sel_messages += 1
                         opener = _extract_opener(snippet)
                         if opener:
                             recent_sel_openers.append(opener)
                     else:
-                        speaker_counts[msg.author.display_name] += 1
+                        if msg_is_recent:
+                            speaker_counts[msg.author.display_name] += 1
+                            if msg.author.id == message.author.id:
+                                recent_author_messages += 1
+                            else:
+                                recent_other_names.add(msg.author.display_name)
         except Exception as exc:
             logger.warning("Failed to fetch recent history for channel %s: %s", message.channel.id, exc)
         recent_context = "\n".join(reversed(recent_msgs))
         topic_keywords = _extract_topic_keywords(recent_msgs)
         speaker_counts[message.author.display_name] += 1
+
+        addressee_scores = score_addressee_intent(
+            clean_content,
+            bot_name,
+            is_reply_to_sel=is_reply_to_sel,
+            is_reply_to_other=is_reply_to_other,
+            is_mentioned_sel=is_mentioned,
+            mentioned_other_names=[member.display_name for member in other_mentions],
+            recent_other_names=sorted(recent_other_names),
+            recent_speaker_counts=speaker_counts,
+            recent_sel_messages=recent_sel_messages,
+            recent_author_messages=recent_author_messages,
+            greeting_target=greeting_target,
+            force_addressed=force_addressed,
+        )
+        addressed_to_sel = bool(addressee_scores["addressed_to_sel"])
+        addressed_to_other = bool(addressee_scores["addressed_to_other"])
+        name_called = bool(addressee_scores["name_called"])
+        direct_question = bool(addressee_scores["direct_question_to_sel"])
+        if bool(addressee_scores["continuation_hint"]):
+            continuation_hit = True
+
+        logger.info(
+            "Addressing score channel=%s to_sel=%.2f to_other=%.2f addressed_sel=%s addressed_other=%s",
+            message.channel.id,
+            float(addressee_scores.get("sel_score", 0.0)),
+            float(addressee_scores.get("other_score", 0.0)),
+            addressed_to_sel,
+            addressed_to_other,
+        )
+
         channel_dynamics = _build_channel_dynamics(
             speaker_counts,
             message.author.display_name,
@@ -2295,20 +3973,49 @@ class SelDiscordClient(discord.Client):
                 channel_dynamics += "\n" + presence_context
             else:
                 channel_dynamics = presence_context
+        active_multi_user = len(speaker_counts) >= 2
 
         # Human-like engagement decision using LLM
         # Always respond if explicitly addressed or asked directly
+        reason = "engagement"
         if addressed_to_other and not addressed_to_sel:
             should_reply = False
+            reason = "addressed_to_other"
+        elif is_reply_to_other and not (addressed_to_sel or direct_question):
+            should_reply = False
+            reason = "reply_to_other"
         elif addressed_to_sel or direct_question:
             should_reply = True
+        elif message.guild and active_multi_user and not continuation_hit:
+            should_reply = False
+            reason = "group_not_addressed"
         else:
+            hormone_pressure = engagement_pressure_from_hormones(
+                hormones,
+                is_continuation=continuation_hit,
+                replying_to_other=is_reply_to_other,
+            )
             # Let the LLM decide based on conversation context and mood
-            should_reply = await self.llm_client.should_engage_naturally(
+            llm_should_reply = await self.llm_client.should_engage_naturally(
                 recent_conversation=recent_context[:2000] if recent_context else "",
                 user_message=clean_content,
                 mood_summary=hormones.natural_language_summary(),
                 is_continuation=continuation_hit
+            )
+            if hormone_pressure <= -0.22:
+                should_reply = False
+                reason = "hormone_low_engagement"
+            elif hormone_pressure >= 0.45 and continuation_hit:
+                should_reply = True
+                reason = "hormone_high_engagement"
+            else:
+                should_reply = llm_should_reply
+            logger.info(
+                "Engagement arbitration channel=%s llm=%s hormone=%.3f continuation=%s",
+                message.channel.id,
+                llm_should_reply,
+                hormone_pressure,
+                continuation_hit,
             )
 
         if not should_reply:
@@ -2323,7 +4030,6 @@ class SelDiscordClient(discord.Client):
                 await session.merge(global_state)
                 await session.merge(user_state)
                 await session.commit()
-            reason = "addressed_to_other" if addressed_to_other and not addressed_to_sel else "engagement"
             logger.info(
                 "Decision: silent channel=%s reason=%s ms_since=%s secs_since=%s cortisol=%.2f melatonin=%.2f novelty=%.2f",
                 message.channel.id,
@@ -2365,13 +4071,34 @@ class SelDiscordClient(discord.Client):
         # Global memory = SEL remembers across ALL channels like a real person
         memory_id = self._get_memory_id(str(message.channel.id))
         memory_query = clean_content
-        semantic_mems = await self.memory_manager.retrieve(
-            memory_id, memory_query, limit=self.settings.memory_recall_limit
+        recall_limit = int(getattr(self.settings, "memory_recall_limit", 30))
+        if fast_mode_enabled and len(clean_content) <= fast_classify_chars:
+            try:
+                fast_recall_limit = max(
+                    6,
+                    int(getattr(self.settings, "response_fast_mode_memory_recall_limit", 18)),
+                )
+            except Exception:
+                fast_recall_limit = 18
+            recall_limit = min(recall_limit, fast_recall_limit)
+
+        use_semantic_recall = not (
+            fast_mode_enabled
+            and len(clean_content) <= fast_classify_chars
+            and not has_image_attachment
         )
-        _recent_count = max(5, self.settings.memory_recall_limit // 5)
-        _recent_mems = await self.memory_manager.retrieve_recent(memory_id, limit=_recent_count)
-        _seen_sums = {m.summary for m in semantic_mems}
-        memories = semantic_mems + [m for m in _recent_mems if m.summary not in _seen_sums]
+        semantic_mems = (
+            await self.memory_manager.retrieve(memory_id, memory_query, limit=recall_limit)
+            if use_semantic_recall
+            else []
+        )
+        if len(semantic_mems) >= recall_limit:
+            memories = semantic_mems
+        else:
+            _recent_count = max(3, recall_limit // 4)
+            _recent_mems = await self.memory_manager.retrieve_recent(memory_id, limit=_recent_count)
+            _seen_sums = {m.summary for m in semantic_mems}
+            memories = semantic_mems + [m for m in _recent_mems if m.summary not in _seen_sums]
         # Debug: Log retrieved memories
         logger.info(f"Retrieved {len(memories)} memories for query: '{memory_query[:100]}'")
         if memories:
@@ -2415,34 +4142,43 @@ class SelDiscordClient(discord.Client):
         emoji_block = ", ".join(emoji_names[:30]) if emoji_names else None
         image_descriptions: list[str] = []
         image_sources: list[tuple[str, Optional[str], str]] = []
+        video_sources: list[tuple[str, Optional[str], str]] = []
         seen_urls: set[str] = set()
 
-        for attachment in message.attachments:
-            if not _attachment_looks_like_image(attachment):
-                continue
-            url = attachment.url
-            if not url or url in seen_urls:
-                continue
-            image_sources.append((url, normalize_content_type(attachment.content_type), "attachment"))
-            seen_urls.add(url)
-
-        for embed in message.embeds:
-            for url in _extract_embed_image_urls(embed):
+        def _collect_media(msg: discord.Message, label_prefix: str) -> None:
+            for attachment in msg.attachments:
+                url = attachment.url
                 if not url or url in seen_urls:
                     continue
-                if not looks_like_image_url(url):
+                ct = normalize_content_type(attachment.content_type)
+                if _attachment_looks_like_video(attachment):
+                    video_sources.append((url, ct, f"{label_prefix}attachment"))
+                    seen_urls.add(url)
+                elif _attachment_looks_like_image(attachment):
+                    image_sources.append((url, ct, f"{label_prefix}attachment"))
+                    seen_urls.add(url)
+            for embed in msg.embeds:
+                for url in _extract_embed_image_urls(embed):
+                    if not url or url in seen_urls:
+                        continue
+                    if looks_like_video_url(url):
+                        video_sources.append((url, None, f"{label_prefix}embed"))
+                        seen_urls.add(url)
+                    elif looks_like_image_url(url):
+                        image_sources.append((url, None, f"{label_prefix}embed"))
+                        seen_urls.add(url)
+            for sticker in msg.stickers:
+                url = getattr(sticker, "url", None)
+                if not url or url in seen_urls:
                     continue
-                image_sources.append((url, None, "embed"))
-                seen_urls.add(url)
+                if looks_like_image_url(url):
+                    image_sources.append((url, _sticker_content_type(sticker), f"{label_prefix}sticker"))
+                    seen_urls.add(url)
 
-        for sticker in message.stickers:
-            url = getattr(sticker, "url", None)
-            if not url or url in seen_urls:
-                continue
-            if not looks_like_image_url(url):
-                continue
-            image_sources.append((url, _sticker_content_type(sticker), "sticker"))
-            seen_urls.add(url)
+        _collect_media(message, "")
+        # Also pull media from the message being replied to.
+        if referenced_message is not None:
+            _collect_media(referenced_message, "reply_")
 
         for url, content_type, source in image_sources:
             try:
@@ -2496,6 +4232,24 @@ class SelDiscordClient(discord.Client):
             except Exception as exc:
                 logger.warning("Failed to describe image/GIF %s source=%s: %s", url, source, exc)
 
+        for url, content_type, source in video_sources:
+            try:
+                logger.info("Analyzing video clip: %s source=%s", url, source)
+                caption = await self.video_analyzer.analyze_video(url, self.llm_client)
+                if caption:
+                    image_descriptions.append(caption)
+                    logger.info(
+                        "Video analyzed for channel=%s url=%s caption=%s source=%s",
+                        message.channel.id,
+                        url,
+                        caption[:160],
+                        source,
+                    )
+                else:
+                    logger.warning("Failed to analyze video %s source=%s", url, source)
+            except Exception as exc:
+                logger.warning("Failed to describe video %s source=%s: %s", url, source, exc)
+
         if image_descriptions:
             media_effects = _media_mood_effects(image_descriptions)
             if media_effects:
@@ -2530,58 +4284,133 @@ class SelDiscordClient(discord.Client):
         except Exception:
             local_time = None
 
-        # Feature flag: use configured prompt variant for this channel
-        build_messages, prompt_variant = self._select_prompt_builder(str(message.channel.id))
-        logger.info(
-            "Prompt variant %s selected for channel=%s user_message=%s",
-            prompt_variant,
-            message.channel.id,
-            message.id,
+        generation_policy = _generation_policy_from_mood(
+            hormones,
+            is_continuation=continuation_hit,
+            direct_question=direct_question,
         )
-
-        system_messages = build_messages(
+        await self._refresh_interoception_snapshot(
+            trigger="message",
+            hormones=_copy_hormones(hormones),
+            preferred_channel_id=str(message.channel.id),
+        )
+        env_policy = self._get_behavior_environment_policy()
+        generation_policy = self._merge_generation_policy(generation_policy, env_policy)
+        style_guidance = derive_style_guidance(
             global_state=global_state,
-            channel_state=channel_state,
-            memories=memories,
-            addressed_user=user_state,
-            persona_seed=global_state.base_persona or self.settings.persona_seed,
-            recent_context=recent_context,
-            name_context=name_context,
-            available_emojis=emoji_block,
-            image_descriptions=image_descriptions or None,
-            local_time=local_time,
-            style_hint=style_hint,
-            avoid_openers=recent_sel_openers,
-            channel_dynamics=channel_dynamics,
+            user_state=user_state,
+            sentiment=str(classification.get("sentiment", "neutral")),
+            intensity=float(classification.get("intensity", 0.3) or 0.3),
+            playful=bool(classification.get("playful", False)),
+            user_content=clean_content,
+            direct_question=direct_question,
+            hormones=hormones,
+        )
+        style_guidance = _apply_style_policy(style_guidance, generation_policy)
+        style_hint = self._combine_style_hints(
+            self._combine_style_hints(
+                format_style_hint(style_guidance),
+                self._environment_style_hint(env_policy),
+            ),
+            self._get_behavior_style_hint(),
+        )
+        style_hint = self._combine_style_hints(style_hint, self._interoception_style_hint())
+        style_hint = self._combine_style_hints(
+            style_hint,
+            _discord_user_style_hint(
+                bool(getattr(self.settings, "sel_discord_user_style_enabled", True)),
+                multi_message_enabled=bool(getattr(self.settings, "sel_multi_message_mode_enabled", True)),
+            ),
+        )
+        logger.info(
+            "Mood generation policy channel=%s pressure=%.3f temp_x=%.2f max_sentences=%s max_chars=%s split=%s",
+            message.channel.id,
+            float(generation_policy.get("pressure", 0.0)),
+            float(generation_policy.get("temp_multiplier", 1.0)),
+            int(generation_policy.get("max_sentences", 3)),
+            int(generation_policy.get("max_chars", 420)),
+            bool(generation_policy.get("allow_split", False)),
         )
 
-        # If message was image-only, enrich user content with image captions so the LLM can react to it
-        user_content_for_llm = clean_content
-        if not user_content_for_llm and image_descriptions:
-            user_content_for_llm = "User shared images:\n" + "\n".join(f"- {d}" for d in image_descriptions)
-        elif image_descriptions:
-            user_content_for_llm = user_content_for_llm + "\n[Images]\n" + "\n".join(f"- {d}" for d in image_descriptions)
+        agent_system_context = await self._maybe_run_agent_autonomy(
+            clean_content=clean_content,
+            recent_context=recent_context,
+            direct_question=direct_question,
+            continuation_hit=continuation_hit,
+            channel_id=str(message.channel.id),
+            user_id=str(message.author.id),
+        )
+        direct_agent_reply = _extract_direct_agent_reply(agent_system_context or "")
+        direct_operator_mode = bool(direct_agent_reply)
+        if direct_agent_reply:
+            # Terminal-agent direct mode: return command output without LLM rewrite.
+            reply_text = direct_agent_reply
+            latency_ms = 0
+        else:
+            # Feature flag: use configured prompt variant for this channel
+            build_messages, prompt_variant = self._select_prompt_builder(str(message.channel.id))
+            logger.info(
+                "Prompt variant %s selected for channel=%s user_message=%s",
+                prompt_variant,
+                message.channel.id,
+                message.id,
+            )
 
-        start = time.perf_counter()
-        try:
-            response_temp = temperature_for_hormones(hormones, self.settings.openrouter_main_temp)
-            reply = await self.llm_client.generate_reply(
-                system_messages,
-                user_content=user_content_for_llm,
-                temperature=response_temp,
+            system_messages = build_messages(
+                global_state=global_state,
+                channel_state=channel_state,
+                memories=memories,
+                addressed_user=user_state,
+                persona_seed=global_state.base_persona or self.settings.persona_seed,
+                recent_context=recent_context,
+                name_context=name_context,
+                available_emojis=emoji_block,
+                image_descriptions=image_descriptions or None,
+                local_time=local_time,
+                style_hint=style_hint,
+                avoid_openers=recent_sel_openers,
+                channel_dynamics=channel_dynamics,
             )
-        except Exception as exc:
-            err_text = f"{type(exc).__name__}: {exc}"
-            logger.error("LLM reply generation failed: %s", err_text)
-            reply = (
-                "My brain call glitched (LLM error). "
-                f"It complained: {err_text}. "
-                "I'm still reading—try again in a moment."
+            if agent_system_context:
+                system_messages.append({"role": "system", "content": agent_system_context})
+
+            # If message was image-only, enrich user content with image captions so the LLM can react to it
+            user_content_for_llm = clean_content
+            if not user_content_for_llm and image_descriptions:
+                user_content_for_llm = "User shared images:\n" + "\n".join(f"- {d}" for d in image_descriptions)
+            elif image_descriptions:
+                user_content_for_llm = user_content_for_llm + "\n[Images]\n" + "\n".join(f"- {d}" for d in image_descriptions)
+
+            start = time.perf_counter()
+            try:
+                response_temp = temperature_for_hormones(hormones, self.settings.openrouter_main_temp)
+                response_temp = _clamp(
+                    response_temp * float(generation_policy.get("temp_multiplier", 1.0)),
+                    0.1,
+                    1.35,
+                )
+                reply = await self.llm_client.generate_reply(
+                    system_messages,
+                    user_content=user_content_for_llm,
+                    temperature=response_temp,
+                )
+            except Exception as exc:
+                err_text = f"{type(exc).__name__}: {exc}"
+                logger.error("LLM reply generation failed: %s", err_text)
+                reply = (
+                    "My brain call glitched (LLM error). "
+                    f"It complained: {err_text}. "
+                    "I'm still reading—try again in a moment."
+                )
+            reply = _adjust_repeated_opener(reply, recent_sel_openers)
+            reply = _add_human_touches(reply, hormones)
+            reply = _enforce_reply_policy(
+                reply,
+                max_sentences=int(generation_policy.get("max_sentences", 3)),
+                max_chars=int(generation_policy.get("max_chars", 420)),
             )
-        reply = _adjust_repeated_opener(reply, recent_sel_openers)
-        reply = _add_human_touches(reply, hormones)
-        latency_ms = int((time.perf_counter() - start) * 1000)
-        reply_text = (reply or "").strip() or "(no response)"
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            reply_text = (reply or "").strip() or "(no response)"
 
         # Assess response confidence
         confidence_assessment = self.confidence_scorer.assess_response_confidence(
@@ -2615,18 +4444,97 @@ class SelDiscordClient(discord.Client):
         await asyncio.gather(_typing_task, return_exceptions=True)
         sent_msg: Optional[discord.Message] = None
         effective_suppress = suppress_text_reply or self.settings.voice_only_responses
+        reply_chunks = [reply_text]
+        multi_enabled = bool(getattr(self.settings, "sel_multi_message_mode_enabled", True))
+        burst_mode = bool(getattr(self.settings, "sel_multi_message_burst_mode", True))
+        try:
+            multi_max_parts = max(2, min(6, int(getattr(self.settings, "sel_multi_message_max_parts", 4))))
+        except Exception:
+            multi_max_parts = 4
+        try:
+            multi_min_chars = max(60, min(700, int(getattr(self.settings, "sel_multi_message_min_reply_chars", 110))))
+        except Exception:
+            multi_min_chars = 110
+
+        split_requested = (
+            bool(generation_policy.get("allow_split", False)) and style_guidance.pacing == "multi"
+        )
+        split_requested = split_requested or (
+            multi_enabled and (len(reply_text) >= multi_min_chars or "\n" in reply_text)
+        )
+        if direct_operator_mode:
+            split_requested = False
+        if split_requested and not effective_suppress:
+            split_chunks = _split_reply_for_cadence(
+                reply_text,
+                max_parts=multi_max_parts,
+                min_total_chars=multi_min_chars,
+            )
+            if len(split_chunks) > 1:
+                reply_chunks = split_chunks
+
+        if burst_mode and len(reply_chunks) > 1:
+            delay = min(delay, 0.65)
+        tts_text = " ".join(chunk.strip() for chunk in reply_chunks if chunk.strip()) or reply_text
         if effective_suppress:
             await asyncio.sleep(delay)
         else:
             try:
                 await asyncio.sleep(delay)
-                sent_msg = await message.reply(reply_text, mention_author=False)
+                sent_msg = await message.reply(reply_chunks[0], mention_author=False)
+                for index, chunk in enumerate(reply_chunks[1:], start=1):
+                    await asyncio.sleep(
+                        _followup_delay(
+                            chunk,
+                            hormones,
+                            index,
+                            burst_mode=burst_mode and len(reply_chunks) > 1,
+                        )
+                    )
+                    await message.channel.send(chunk)
             except Exception as exc:
-                logger.warning("Failed to send reply in channel %s: %s", message.channel.id, exc)
-                return
+                # message.reply() fails with 50035 if the original message was deleted.
+                # Fall back to a plain channel send so the response isn't dropped.
+                logger.warning("Failed to send reply in channel %s: %s — retrying as plain send", message.channel.id, exc)
+                try:
+                    sent_msg = await message.channel.send(reply_chunks[0])
+                    for index, chunk in enumerate(reply_chunks[1:], start=1):
+                        await asyncio.sleep(
+                            _followup_delay(
+                                chunk,
+                                hormones,
+                                index,
+                                burst_mode=burst_mode and len(reply_chunks) > 1,
+                            )
+                        )
+                        await message.channel.send(chunk)
+                except Exception as exc2:
+                    logger.warning("Fallback send also failed in channel %s: %s", message.channel.id, exc2)
+                    return
         if message.guild and message.guild.voice_client and message.guild.voice_client.is_connected():
             self.voice_announce_channel_ids[message.guild.id] = message.channel.id
-        await self._maybe_queue_tts(message, reply_text)
+        await self._maybe_queue_tts(message, tts_text)
+        if (
+            sent_msg is not None
+            and not effective_suppress
+            and bool(getattr(self.settings, "sel_discord_reactions_enabled", True))
+        ):
+            try:
+                reaction_chance = float(getattr(self.settings, "sel_discord_reaction_chance", 0.32))
+            except Exception:
+                reaction_chance = 0.32
+            reaction_chance = max(0.0, min(1.0, reaction_chance))
+            if random.random() < reaction_chance:
+                reaction = _pick_discord_reaction(
+                    sentiment=sentiment,
+                    playful=playful,
+                    hormones=hormones,
+                )
+                if reaction:
+                    try:
+                        await message.add_reaction(reaction)
+                    except Exception:
+                        pass
 
         global_state.total_messages_sent += 1
         channel_state.last_response_ts = now
@@ -3181,6 +5089,462 @@ class SelDiscordClient(discord.Client):
         else:
             await interaction.followup.send(msg, ephemeral=True)
 
+    async def _cmd_agents(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        enabled = bool(getattr(self.settings, "agent_autonomy_enabled", True))
+        safe_agents = list(getattr(self.settings, "agent_autonomy_safe_agents", []))
+        min_conf = float(getattr(self.settings, "agent_autonomy_min_confidence", 0.58))
+
+        if not enabled:
+            await interaction.followup.send(
+                "Agent autonomy is disabled (`AGENT_AUTONOMY_ENABLED=false`).",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            eligible = self._get_available_agents(force=True)
+            loaded = self.agents_manager.list_agents(force_reload=False)
+        except Exception as exc:
+            await interaction.followup.send(f"Failed to load agents: {exc}", ephemeral=True)
+            return
+
+        eligible_names = {name for name, _ in eligible}
+        runnable_loaded = sorted(
+            agent.name
+            for agent in loaded
+            if agent.name and (agent.run or agent.tool)
+        )
+        blocked = [name for name in runnable_loaded if name not in eligible_names]
+
+        lines = [
+            "**Agent Autonomy**",
+            f"Enabled: {enabled}",
+            f"Min confidence: {min_conf:.2f}",
+            f"Safe allowlist: {', '.join(safe_agents) if safe_agents else '(none)'}",
+            f"Runnable loaded: {len(runnable_loaded)}",
+            f"Autonomy-eligible: {len(eligible)}",
+            "",
+            "**Eligible Agents:**",
+        ]
+        if eligible:
+            for name, desc in eligible[:20]:
+                lines.append(f"- `{name}`: {desc}")
+        else:
+            lines.append("- (none)")
+
+        lines.append("")
+        lines.append("**Blocked/Non-Eligible Runnable Agents:**")
+        if blocked:
+            for name in blocked[:25]:
+                lines.append(f"- `{name}`")
+            if len(blocked) > 25:
+                lines.append(f"- ... and {len(blocked) - 25} more")
+        else:
+            lines.append("- (none)")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1900:
+            await interaction.followup.send(msg[:1900], ephemeral=True)
+            await interaction.followup.send(msg[1900:], ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+
+    async def _cmd_seal(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            snapshot = self.seal_editor.get_status_snapshot()
+        except Exception as exc:
+            await interaction.followup.send(f"Failed to load SEAL status: {exc}", ephemeral=True)
+            return
+
+        mode_probs = snapshot.get("mode_probabilities", {})
+        p_new = float(mode_probs.get("new_tool", 0.0)) * 100.0
+        p_improve = float(mode_probs.get("improve_existing_tool", 0.0)) * 100.0
+        p_self = float(mode_probs.get("self_code_edit", 0.0)) * 100.0
+
+        lines = [
+            "**SEAL Status**",
+            f"Enabled: {snapshot.get('enabled', False)}",
+            f"Score: {snapshot.get('score', 0)}",
+            f"Pass/Fail: {snapshot.get('pass_count', 0)}/{snapshot.get('fail_count', 0)}",
+            f"Self-edit gate pass/fail: {snapshot.get('self_edit_pass_count', 0)}/{snapshot.get('self_edit_fail_count', 0)}",
+            f"Last mode: {snapshot.get('last_mode', 'new_tool')}",
+            f"Auto agents: {snapshot.get('auto_agent_count', 0)}",
+            "",
+            "**Mode Probabilities**",
+            f"- new_tool: {p_new:.1f}%",
+            f"- improve_existing_tool: {p_improve:.1f}%",
+            f"- self_code_edit: {p_self:.1f}%",
+            "",
+            "**Recent Self-Edits**",
+        ]
+
+        recent = list(snapshot.get("recent_self_edits", []))
+        if recent:
+            for event in reversed(recent[-8:]):
+                ts = str(event.get("timestamp", "?"))
+                mode = str(event.get("mode", "?"))
+                result = str(event.get("result", "?"))
+                file_path = str(event.get("file", "?"))
+                detail = str(event.get("detail", "")).strip()
+                detail_suffix = f" | {detail}" if detail else ""
+                lines.append(f"- `{ts}` `{mode}` `{result}` `{file_path}`{detail_suffix}")
+        else:
+            lines.append("- (none yet)")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1900:
+            await interaction.followup.send(msg[:1900], ephemeral=True)
+            await interaction.followup.send(msg[1900:], ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+
+    async def _cmd_behavior(self, interaction: discord.Interaction, refresh: bool = False) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._is_admin(interaction.user.id):
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+
+        if refresh or not self._computer_behavior_profile:
+            trigger = f"manual_discord:{interaction.user.id}"
+            await self._run_computer_behavior_analysis(trigger=trigger)
+
+        profile = self._computer_behavior_profile
+        if not profile:
+            await interaction.followup.send(
+                "No computer behavior profile found yet. Set `SEL_BEHAVIOR_ADAPTATION_ENABLED=true` and run again with `refresh=true`.",
+                ephemeral=True,
+            )
+            return
+
+        adaptation = profile.get("adaptation", {}) if isinstance(profile, dict) else {}
+        shell = profile.get("shell", {}) if isinstance(profile, dict) else {}
+        filesystem = profile.get("filesystem", {}) if isinstance(profile, dict) else {}
+        web_behavior = profile.get("web_behavior", {}) if isinstance(profile, dict) else {}
+        top_families = shell.get("family_counts_top", []) if isinstance(shell, dict) else []
+        top_commands = [
+            str(entry.get("command", "")).strip()
+            for entry in top_families[:6]
+            if isinstance(entry, dict) and str(entry.get("command", "")).strip()
+        ]
+        keywords = adaptation.get("suggested_keywords", []) if isinstance(adaptation, dict) else []
+        if not isinstance(keywords, list):
+            keywords = []
+        active_hours = adaptation.get("active_hours_utc", []) if isinstance(adaptation, dict) else []
+        if not isinstance(active_hours, list):
+            active_hours = []
+        changes = self._computer_behavior_last_changes or {}
+        generated_at = str(profile.get("generated_at_utc", "unknown"))
+        last_run = (
+            self._computer_behavior_last_run_ts.isoformat()
+            if isinstance(self._computer_behavior_last_run_ts, dt.datetime)
+            else "unknown"
+        )
+        technicality = float(adaptation.get("technicality_bias", 0.0) or 0.0) if isinstance(adaptation, dict) else 0.0
+        adaptation_strength = (
+            float(adaptation.get("adaptation_strength", 0.0) or 0.0)
+            if isinstance(adaptation, dict)
+            else 0.0
+        )
+        active_rhythm = str(adaptation.get("active_rhythm", "unknown")) if isinstance(adaptation, dict) else "unknown"
+        interaction_style = str(adaptation.get("interaction_style", "unknown")) if isinstance(adaptation, dict) else "unknown"
+        search_domains = adaptation.get("search_domains", []) if isinstance(adaptation, dict) else []
+        if not isinstance(search_domains, list):
+            search_domains = []
+
+        lines = [
+            "**Computer Behavior Adaptation**",
+            f"Enabled: {bool(getattr(self.settings, 'sel_behavior_adaptation_enabled', True))}",
+            f"Global tuning enabled: {bool(getattr(self.settings, 'sel_behavior_apply_global_tuning', True))}",
+            f"Full adaptation mode: {bool(getattr(self.settings, 'sel_behavior_full_adaptation', True))}",
+            f"Pass/Fail: {self._computer_behavior_passes}/{self._computer_behavior_failures}",
+            f"Last trigger: {self._computer_behavior_last_trigger or 'none'}",
+            f"Last run: {last_run}",
+            f"Generated at: {generated_at}",
+            f"Profile path: `{self.computer_behavior_analyzer.profile_path}`",
+            f"Window days: {profile.get('window_days', 'n/a')}",
+            f"Shell commands sampled: {shell.get('commands_total', 0) if isinstance(shell, dict) else 0}",
+            f"Files considered: {filesystem.get('files_considered', 0) if isinstance(filesystem, dict) else 0}",
+            "",
+            "**Adaptation**",
+            f"- Technicality bias: {max(0.0, min(1.0, technicality)):.2f}",
+            f"- Adaptation strength: {max(0.0, min(1.0, adaptation_strength)):.2f}",
+            f"- Preferred reply length: {adaptation.get('preferred_reply_length', 'unknown') if isinstance(adaptation, dict) else 'unknown'}",
+            f"- Rhythm: {active_rhythm}",
+            f"- Interaction style: {interaction_style}",
+            f"- Active hours (UTC): {', '.join(str(x) for x in active_hours[:6]) if active_hours else '(none)'}",
+            f"- Suggested keywords: {', '.join(str(x) for x in keywords[:8]) if keywords else '(none)'}",
+            f"- Search domains: {', '.join(str(x) for x in search_domains[:6]) if search_domains else '(none)'}",
+            "",
+            "**Web Signals**",
+            f"- Web events: {web_behavior.get('events_total', 0) if isinstance(web_behavior, dict) else 0}",
+            f"- Vision events: {web_behavior.get('vision_events', 0) if isinstance(web_behavior, dict) else 0}",
+            f"- Avg images detected: {web_behavior.get('avg_images_detected', 0.0) if isinstance(web_behavior, dict) else 0.0}",
+            "",
+            "**Top Commands**",
+            f"{', '.join(top_commands) if top_commands else '(none)'}",
+            "",
+            "**Last Applied Changes**",
+        ]
+        if changes:
+            for key, value in changes.items():
+                lines.append(f"- `{key}`: {value}")
+        else:
+            lines.append("- (no changes applied)")
+        if self._computer_behavior_last_error:
+            lines.append("")
+            lines.append(f"Last error: `{self._computer_behavior_last_error}`")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1900:
+            await interaction.followup.send(msg[:1900], ephemeral=True)
+            await interaction.followup.send(msg[1900:], ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+
+    async def _cmd_interoception(self, interaction: discord.Interaction, refresh: bool = False) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._is_admin(interaction.user.id):
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+        if refresh or not self._interoception_latest:
+            await self._refresh_interoception_snapshot(
+                trigger=f"manual_discord:{interaction.user.id}",
+                preferred_channel_id=str(interaction.channel_id or "interoception"),
+            )
+
+        snapshot = self._interoception_latest
+        if not snapshot:
+            await interaction.followup.send(
+                "No interoception snapshot available yet.",
+                ephemeral=True,
+            )
+            return
+
+        metrics = snapshot.get("metrics", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(metrics, dict):
+            metrics = {}
+        last_run = (
+            self._interoception_last_run_ts.isoformat()
+            if isinstance(self._interoception_last_run_ts, dt.datetime)
+            else "unknown"
+        )
+        lines = [
+            "**Interoception Status**",
+            f"Enabled: {bool(getattr(self.settings, 'sel_interoception_enabled', True))}",
+            f"Pass/Fail: {self._interoception_pass_count}/{self._interoception_fail_count}",
+            f"Last run: {last_run}",
+            f"Mode: {snapshot.get('mode', 'unknown')}",
+            f"Summary: {snapshot.get('summary', '(none)')}",
+            f"Log path: `{self.interoception_engine.log_path}`",
+            f"Sensor stream: `{self.interoception_engine.sensor_path}`",
+            "",
+            "**Metrics**",
+        ]
+        for key in (
+            "fatigue",
+            "stress_load",
+            "social_need",
+            "cognitive_load",
+            "arousal",
+            "mood_stability",
+            "sensory_load",
+            "circadian_pressure",
+            "adaptation_drive",
+            "energy_budget",
+            "sleep_drive",
+        ):
+            value = _clamp(float(metrics.get(key, 0.0) or 0.0))
+            lines.append(f"- {key}: {value:.3f}")
+
+        if self._interoception_last_error:
+            lines.append("")
+            lines.append(f"Last error: `{self._interoception_last_error}`")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1900:
+            await interaction.followup.send(msg[:1900], ephemeral=True)
+            await interaction.followup.send(msg[1900:], ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+
+    async def _cmd_operator(self, interaction: discord.Interaction, command: str = "") -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._is_admin(interaction.user.id):
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+
+        enabled = bool(getattr(self.settings, "sel_operator_mode_enabled", False))
+        full_privileges = bool(getattr(self.settings, "sel_operator_full_host_privileges", False))
+        require_approval_user = bool(getattr(self.settings, "sel_operator_require_approval_user", True))
+        intent_threshold = float(getattr(self.settings, "sel_operator_command_intent_threshold", 0.6))
+        direct_reply_enabled = bool(getattr(self.settings, "sel_operator_direct_reply_enabled", False))
+        operator_agents = [
+            item.strip().lower()
+            for item in getattr(self.settings, "sel_operator_agents", [])
+            if str(item).strip()
+        ]
+        log_path = self._resolve_sel_data_path("operator_command_log.jsonl")
+
+        if not command.strip():
+            lines = [
+                "**Operator Status**",
+                f"Mode enabled: {enabled}",
+                f"Full host privileges: {full_privileges}",
+                f"Require approval user: {require_approval_user}",
+                f"Command intent threshold: {intent_threshold:.2f}",
+                f"Direct operator replies: {direct_reply_enabled}",
+                f"Operator agents: {', '.join(operator_agents) if operator_agents else '(none)'}",
+                f"Log path: `{log_path}`",
+            ]
+            if log_path.exists():
+                try:
+                    recent = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except Exception:
+                    recent = []
+                lines.append("")
+                lines.append("**Recent Commands**")
+                for line in recent[-3:]:
+                    try:
+                        parsed = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(parsed, dict):
+                        continue
+                    ts = str(parsed.get("timestamp_utc", "?"))
+                    cmd = str(parsed.get("command", "")).strip()
+                    blocked = bool(parsed.get("blocked", False))
+                    code = parsed.get("exit_code", "-")
+                    lines.append(f"- `{ts}` blocked={blocked} exit={code} cmd={cmd[:120]}")
+            msg = "\n".join(lines)
+            if len(msg) <= 1900:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                for idx in range(0, len(msg), 1900):
+                    await interaction.followup.send(msg[idx : idx + 1900], ephemeral=True)
+            return
+
+        try:
+            operator_kwargs: dict[str, Any] = {
+                "operator_mode_enabled": bool(getattr(self.settings, "sel_operator_mode_enabled", False)),
+                "operator_full_host_privileges": bool(
+                    getattr(self.settings, "sel_operator_full_host_privileges", False)
+                ),
+                "operator_require_approval_user": bool(
+                    getattr(self.settings, "sel_operator_require_approval_user", True)
+                ),
+                "operator_command_timeout_seconds": int(
+                    getattr(self.settings, "sel_operator_command_timeout_seconds", 45)
+                ),
+                "operator_max_output_chars": int(getattr(self.settings, "sel_operator_max_output_chars", 6000)),
+                "operator_block_patterns": list(getattr(self.settings, "sel_operator_block_patterns", []) or []),
+                "operator_data_dir": str(getattr(self.settings, "sel_data_dir", "./sel_data")),
+            }
+            approval_user_id = getattr(self.settings, "approval_user_id", None)
+            if approval_user_id is not None:
+                operator_kwargs["operator_approval_user_id"] = str(approval_user_id)
+            result = await self.agents_manager.run_agent_async(
+                "system_operator",
+                command,
+                user_id=str(interaction.user.id),
+                channel_id=str(interaction.channel_id or ""),
+                invoked_by="slash",
+                **operator_kwargs,
+            )
+            result_text = str(result).strip() or "(empty output)"
+        except Exception as exc:
+            result_text = f"Operator execution failed: {exc}"
+
+        if len(result_text) <= 1900:
+            await interaction.followup.send(result_text, ephemeral=True)
+        else:
+            for idx in range(0, len(result_text), 1900):
+                await interaction.followup.send(result_text[idx : idx + 1900], ephemeral=True)
+
+    async def _cmd_dream(self, interaction: discord.Interaction, run_now: bool = False) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._is_admin(interaction.user.id):
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+
+        manual_result: Optional[dict[str, Any]] = None
+        if run_now:
+            trigger = f"manual_discord:{interaction.user.id}"
+            manual_result = await self._run_dream_cycle(trigger=trigger)
+
+        last_run = (
+            self._dream_last_run_ts.isoformat()
+            if isinstance(self._dream_last_run_ts, dt.datetime)
+            else "unknown"
+        )
+        recent = load_recent_jsonl(self._dream_journal_path, limit=3)
+        latest = recent[-1] if recent else {}
+        latest_dream = latest.get("dream", {}) if isinstance(latest, dict) else {}
+        latest_title = (
+            str(latest_dream.get("title", "none")) if isinstance(latest_dream, dict) else "none"
+        )
+        latest_time = str(latest.get("timestamp_utc", "none")) if isinstance(latest, dict) else "none"
+        latest_memories = int(latest.get("memory_count", 0)) if isinstance(latest, dict) else 0
+
+        lines = [
+            "**Dream Status**",
+            f"Enabled: {bool(getattr(self.settings, 'sel_dream_enabled', True))}",
+            f"On startup: {bool(getattr(self.settings, 'sel_dream_on_start', True))}",
+            f"Interval minutes: {float(getattr(self.settings, 'sel_dream_interval_minutes', 90.0)):.1f}",
+            f"Min inactive hours: {float(getattr(self.settings, 'sel_dream_min_inactive_hours', 1.5)):.2f}",
+            f"Pass/Fail: {self._dream_pass_count}/{self._dream_fail_count}",
+            f"Last trigger: {self._dream_last_trigger or 'none'}",
+            f"Last run: {last_run}",
+            f"Journal: `{self._dream_journal_path}`",
+            f"Latest markdown: `{self._dream_latest_path}`",
+            "",
+            "**Latest Dream**",
+            f"- Time: {latest_time}",
+            f"- Title: {latest_title}",
+            f"- Source memories: {latest_memories}",
+        ]
+        if manual_result is None and run_now:
+            lines.append("- Manual run skipped (sleep/inactivity gate or dream disabled)")
+        if self._dream_last_error:
+            lines.append("")
+            lines.append(f"Last error: `{self._dream_last_error}`")
+
+        msg = "\n".join(lines)
+        if len(msg) > 1900:
+            await interaction.followup.send(msg[:1900], ephemeral=True)
+            await interaction.followup.send(msg[1900:], ephemeral=True)
+        else:
+            await interaction.followup.send(msg, ephemeral=True)
+
+    async def _cmd_export_data(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not self._is_admin(interaction.user.id):
+            await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
+            return
+
+        trigger = f"manual_discord:{interaction.user.id}"
+        snapshot = await self._export_model_dataset_snapshot(trigger=trigger)
+        if snapshot is None:
+            await interaction.followup.send(
+                "Failed to export Sel dataset snapshot. Check logs for details.",
+                ephemeral=True,
+            )
+            return
+
+        mb = snapshot.bytes_copied / (1024 * 1024) if snapshot.bytes_copied else 0.0
+        await interaction.followup.send(
+            (
+                "Sel dataset snapshot created.\n"
+                f"- Path: `{snapshot.snapshot_dir}`\n"
+                f"- Files: {snapshot.files_copied}\n"
+                f"- Size: {mb:.2f} MB\n"
+                f"- Manifest: `{snapshot.manifest_path}`"
+            ),
+            ephemeral=True,
+        )
+
     async def _cmd_reset_mood(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         if not self._is_admin(interaction.user.id):
@@ -3210,21 +5574,29 @@ class SelDiscordClient(discord.Client):
         if not self._is_admin(interaction.user.id):
             await interaction.followup.send("You are not authorized to use this command.", ephemeral=True)
             return
-        if day < 1 or day > 28:
-            await interaction.followup.send("Cycle day must be between 1 and 28.", ephemeral=True)
-            return
         global_state = await self._ensure_biological_state_loaded()
         async with self._bio_lock:
+            cycle_length = max(1, int(self.biological_state.menstrual.cycle_length))
+            if day < 1 or day > cycle_length:
+                await interaction.followup.send(
+                    f"Cycle day must be between 1 and {cycle_length}.",
+                    ephemeral=True,
+                )
+                return
             now = dt.datetime.now(dt.timezone.utc)
             self.biological_state.menstrual.cycle_start_date = now - dt.timedelta(days=day - 1)
             phase = self.biological_state.menstrual.get_phase()
+            profile = getattr(self.biological_state.menstrual, "active_profile", "unknown")
             self._bio_dirty = True
         async with self.state_manager.session() as session:
             global_state.biological_state = self.biological_state.to_dict()
             self._bio_dirty = False
             await session.merge(global_state)
             await session.commit()
-        await interaction.followup.send(f"Cycle day set to {day} ({phase}).", ephemeral=True)
+        await interaction.followup.send(
+            f"Cycle day set to {day}/{cycle_length} ({phase}, profile={profile}).",
+            ephemeral=True,
+        )
 
     async def _cmd_set_attachment(self, interaction: discord.Interaction, style: str) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -3258,12 +5630,15 @@ class SelDiscordClient(discord.Client):
         async with self._bio_lock:
             cycle_day = self.biological_state.menstrual.get_cycle_day()
             phase = self.biological_state.menstrual.get_phase()
+            cycle_length = self.biological_state.menstrual.cycle_length
+            cycle_profile = getattr(self.biological_state.menstrual, "active_profile", "unknown")
             lines = [
                 f"sleep_debt_hours: {self.biological_state.sleep_debt.debt_hours:.2f}",
                 f"late_nights: {self.biological_state.sleep_debt.consecutive_late_nights}",
                 f"caffeine_level: {self.biological_state.caffeine.caffeine_level:.2f}",
                 f"caffeine_tolerance: {self.biological_state.caffeine.tolerance:.2f}",
-                f"cycle_day: {cycle_day} ({phase})",
+                f"cycle_day: {cycle_day}/{cycle_length} ({phase})",
+                f"cycle_profile: {cycle_profile}",
                 f"chronic_stress: {self.biological_state.stress.chronic_stress:.2f}",
                 f"attachment_style: {self.biological_state.bonding.attachment_style}",
                 f"last_activity_ts: {self.biological_state.last_activity_ts}",
@@ -3541,6 +5916,42 @@ class SelDiscordClient(discord.Client):
             )
             logger.error(f"Data purge error: {e}")
 
+    async def _apply_feedback_mood_persistence(self, channel_id: str, sentiment: str) -> None:
+        deltas = _feedback_mood_deltas(sentiment)
+        if not deltas:
+            return
+        try:
+            if self.hormone_manager:
+                mood_id = self._get_mood_id(channel_id)
+                cached = await self.hormone_manager.get_state(mood_id)
+                before = _copy_hormones(cached.vector)
+                nudged = _copy_hormones(cached.vector).apply(deltas)
+                alpha = 0.38 if sentiment == "positive" else 0.44
+                persisted = _blend_hormone_vectors(before, nudged, alpha)
+                await self.hormone_manager.update_state(
+                    mood_id,
+                    persisted,
+                    focus_topic=cached.focus_topic,
+                    energy_level=cached.energy_level,
+                    messages_since_response=cached.messages_since_response,
+                    last_response_ts=cached.last_response_ts,
+                )
+            else:
+                channel_state = await self.state_manager.get_channel_state(channel_id)
+                before = HormoneVector.from_channel(channel_state)
+                nudged = _copy_hormones(before).apply(deltas)
+                alpha = 0.38 if sentiment == "positive" else 0.44
+                persisted = _blend_hormone_vectors(before, nudged, alpha)
+                persisted.to_channel(channel_state)
+                await self.state_manager.update_channel_state(channel_state)
+        except Exception as exc:
+            logger.warning(
+                "Feedback mood persistence failed channel=%s sentiment=%s error=%s",
+                channel_id,
+                sentiment,
+                exc,
+            )
+
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User):
         if user.bot or not reaction.message.author or reaction.message.author.id != self.user.id:
             return
@@ -3557,6 +5968,7 @@ class SelDiscordClient(discord.Client):
         global_state = await self.state_manager.ensure_global_state()
         user_state = await self.state_manager.get_user_state(str(user.id), user.name)
         await apply_feedback(self.state_manager, global_state, user_state, feedback)
+        await self._apply_feedback_mood_persistence(str(reaction.message.channel.id), sentiment)
         logger.info(
             "Reaction feedback channel=%s message=%s user=%s sentiment=%s",
             reaction.message.channel.id,
