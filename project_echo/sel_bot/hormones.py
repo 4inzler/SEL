@@ -223,9 +223,27 @@ class HormoneVector:
                     offset = 0.0
                 circadian_baselines[hormone] = _clamp(BASELINE_LEVELS[hormone] + offset)
 
-        # Apply feedback loops
-        cortisol_stress = max(0.0, self.cortisol - 0.3)  # High cortisol inhibits mood
-        serotonin_wellbeing = max(0.0, self.serotonin - 0.3)  # High serotonin boosts bonding
+        # Apply comprehensive feedback loops (everything affects everything)
+        # Pre-compute influence factors from current state
+        cortisol_stress = max(0.0, self.cortisol - 0.3)  # High cortisol = stress
+        serotonin_wellbeing = max(0.0, self.serotonin - 0.2)  # High serotonin = wellbeing
+        dopamine_reward = max(0.0, self.dopamine - 0.15)  # High dopamine = reward state
+        oxytocin_bonding = max(0.0, self.oxytocin - 0.15)  # High oxytocin = social bonding
+        adrenaline_arousal = max(0.0, self.adrenaline - 0.1)  # High adrenaline = arousal
+        melatonin_fatigue = max(0.0, self.melatonin - 0.2)  # High melatonin = fatigue
+        endorphin_euphoria = max(0.0, self.endorphin - 0.1)  # High endorphin = euphoria
+        testosterone_drive = max(0.0, self.testosterone - 0.1)  # High testosterone = drive
+        estrogen_empathy = max(0.0, self.estrogen - 0.1)  # High estrogen = empathy
+        progesterone_calm = max(0.0, self.progesterone - 0.1)  # High progesterone = calm
+
+        # Emotional state influences
+        anxiety_level = max(0.0, self.anxiety - 0.1)
+        excitement_level = max(0.0, self.excitement - 0.1)
+        frustration_level = max(0.0, self.frustration - 0.1)
+        contentment_level = max(0.0, self.contentment - 0.15)
+        loneliness_level = max(0.0, self.loneliness - 0.1)
+        boredom_level = max(0.0, self.boredom - 0.1)
+        confidence_level = max(0.0, self.confidence - 0.15)
 
         for field in DECAY_RATES.keys():
             current = getattr(self, field)
@@ -235,15 +253,196 @@ class HormoneVector:
             # Homeostatic pull toward baseline (exponential decay)
             new_value = current + (baseline - current) * decay_rate
 
-            # Apply feedback modulation
-            if field == "serotonin":
+            # ============================================
+            # NEUROTRANSMITTER FEEDBACK LOOPS
+            # ============================================
+            if field == "dopamine":
+                new_value -= cortisol_stress * 0.04  # Stress dampens reward
+                new_value += endorphin_euphoria * 0.03  # Euphoria boosts dopamine
+                new_value -= melatonin_fatigue * 0.02  # Fatigue reduces motivation
+                new_value += excitement_level * 0.02  # Excitement feeds dopamine
+                new_value -= boredom_level * 0.03  # Boredom depletes dopamine
+                new_value += testosterone_drive * 0.02  # Drive boosts reward-seeking
+
+            elif field == "serotonin":
                 new_value -= cortisol_stress * 0.05  # Stress suppresses serotonin
-            elif field == "dopamine":
-                new_value -= cortisol_stress * 0.03  # Stress dampens reward
+                new_value += oxytocin_bonding * 0.03  # Social bonding boosts mood
+                new_value += contentment_level * 0.02  # Contentment stabilizes serotonin
+                new_value -= anxiety_level * 0.03  # Anxiety depletes serotonin
+                new_value -= loneliness_level * 0.02  # Loneliness lowers mood
+                new_value += estrogen_empathy * 0.02  # Empathy supports wellbeing
+
+            elif field == "adrenaline":
+                new_value += cortisol_stress * 0.06  # Stress triggers fight-or-flight
+                new_value += anxiety_level * 0.04  # Anxiety drives adrenaline
+                new_value += excitement_level * 0.03  # Excitement is arousing
+                new_value -= progesterone_calm * 0.03  # Calming hormones reduce adrenaline
+                new_value -= melatonin_fatigue * 0.02  # Fatigue suppresses arousal
+                new_value += frustration_level * 0.02  # Frustration triggers arousal
+
+            elif field == "endorphin":
+                new_value += dopamine_reward * 0.03  # Reward triggers endorphins
+                new_value -= cortisol_stress * 0.02  # Chronic stress depletes endorphins
+                new_value += oxytocin_bonding * 0.02  # Social bonding releases endorphins
+                new_value += excitement_level * 0.02  # Positive excitement boosts endorphins
+                new_value -= anxiety_level * 0.02  # Anxiety inhibits endorphin release
+
+            # ============================================
+            # HORMONAL FEEDBACK LOOPS
+            # ============================================
+            elif field == "cortisol":
+                new_value += anxiety_level * 0.04  # Anxiety raises cortisol
+                new_value += frustration_level * 0.03  # Frustration is stressful
+                new_value -= serotonin_wellbeing * 0.03  # Wellbeing reduces stress
+                new_value -= oxytocin_bonding * 0.02  # Social support reduces stress
+                new_value -= contentment_level * 0.03  # Contentment lowers cortisol
+                new_value += loneliness_level * 0.02  # Loneliness is stressful
+                new_value -= endorphin_euphoria * 0.02  # Endorphins buffer stress
+
             elif field == "oxytocin":
                 new_value += serotonin_wellbeing * 0.04  # Wellbeing promotes bonding
-            elif field == "adrenaline":
-                new_value += cortisol_stress * 0.06  # Stress drives adrenaline
+                new_value += estrogen_empathy * 0.03  # Empathy drives connection
+                new_value -= cortisol_stress * 0.03  # Stress inhibits bonding
+                new_value -= anxiety_level * 0.02  # Anxiety reduces trust
+                new_value -= loneliness_level * 0.01  # Loneliness craves but inhibits oxytocin
+                new_value += contentment_level * 0.02  # Contentment supports bonding
+
+            elif field == "melatonin":
+                new_value -= adrenaline_arousal * 0.04  # Arousal suppresses sleep
+                new_value -= cortisol_stress * 0.02  # Stress disrupts sleep
+                new_value -= dopamine_reward * 0.02  # Reward-seeking delays sleep
+                new_value += progesterone_calm * 0.02  # Calming promotes sleep
+                new_value -= excitement_level * 0.02  # Excitement prevents sleep
+                new_value += boredom_level * 0.01  # Boredom can induce drowsiness
+
+            elif field == "testosterone":
+                new_value += dopamine_reward * 0.02  # Reward boosts testosterone
+                new_value += confidence_level * 0.02  # Confidence reinforces testosterone
+                new_value -= cortisol_stress * 0.03  # Chronic stress suppresses testosterone
+                new_value += adrenaline_arousal * 0.01  # Arousal can boost testosterone
+                new_value -= anxiety_level * 0.02  # Anxiety suppresses testosterone
+
+            elif field == "estrogen":
+                new_value += oxytocin_bonding * 0.02  # Social bonding supports estrogen
+                new_value += serotonin_wellbeing * 0.02  # Mood stability supports estrogen
+                new_value -= cortisol_stress * 0.02  # Stress disrupts estrogen
+                new_value -= anxiety_level * 0.01  # Anxiety affects hormonal balance
+
+            elif field == "progesterone":
+                new_value += serotonin_wellbeing * 0.02  # Wellbeing supports progesterone
+                new_value -= cortisol_stress * 0.02  # Stress depletes progesterone
+                new_value -= adrenaline_arousal * 0.02  # Arousal opposes calming
+                new_value += contentment_level * 0.02  # Contentment promotes calm
+
+            # ============================================
+            # EMOTIONAL STATE FEEDBACK LOOPS
+            # ============================================
+            elif field == "anxiety":
+                new_value += cortisol_stress * 0.05  # Stress causes anxiety
+                new_value -= serotonin_wellbeing * 0.04  # Wellbeing reduces anxiety
+                new_value -= oxytocin_bonding * 0.03  # Social support reduces anxiety
+                new_value -= endorphin_euphoria * 0.03  # Endorphins calm anxiety
+                new_value += loneliness_level * 0.02  # Loneliness increases anxiety
+                new_value -= progesterone_calm * 0.02  # Calming reduces anxiety
+                new_value -= confidence_level * 0.02  # Confidence reduces anxiety
+
+            elif field == "excitement":
+                new_value += dopamine_reward * 0.04  # Dopamine drives excitement
+                new_value += adrenaline_arousal * 0.03  # Arousal feeds excitement
+                new_value -= melatonin_fatigue * 0.03  # Fatigue dampens excitement
+                new_value -= anxiety_level * 0.02  # Anxiety can dampen excitement
+                new_value += testosterone_drive * 0.02  # Drive boosts excitement
+                new_value -= boredom_level * 0.01  # Resolving boredom creates excitement
+
+            elif field == "frustration":
+                new_value += cortisol_stress * 0.03  # Stress feeds frustration
+                new_value -= dopamine_reward * 0.03  # Reward satisfaction reduces frustration
+                new_value -= serotonin_wellbeing * 0.02  # Wellbeing reduces frustration
+                new_value += boredom_level * 0.02  # Boredom can cause frustration
+                new_value -= contentment_level * 0.03  # Contentment opposes frustration
+                new_value -= endorphin_euphoria * 0.02  # Euphoria reduces frustration
+
+            elif field == "contentment":
+                new_value += serotonin_wellbeing * 0.04  # Wellbeing promotes contentment
+                new_value += oxytocin_bonding * 0.03  # Social bonding brings contentment
+                new_value += endorphin_euphoria * 0.02  # Euphoria supports contentment
+                new_value -= cortisol_stress * 0.04  # Stress opposes contentment
+                new_value -= anxiety_level * 0.03  # Anxiety opposes contentment
+                new_value -= frustration_level * 0.02  # Frustration opposes contentment
+                new_value += progesterone_calm * 0.02  # Calm supports contentment
+
+            elif field == "loneliness":
+                new_value -= oxytocin_bonding * 0.05  # Social bonding cures loneliness
+                new_value += cortisol_stress * 0.02  # Stress can isolate
+                new_value -= serotonin_wellbeing * 0.02  # Wellbeing reduces loneliness
+                new_value += boredom_level * 0.02  # Boredom can feel lonely
+                new_value -= contentment_level * 0.02  # Contentment reduces loneliness
+
+            elif field == "affection":
+                new_value += oxytocin_bonding * 0.04  # Bonding drives affection
+                new_value += estrogen_empathy * 0.03  # Empathy supports affection
+                new_value += serotonin_wellbeing * 0.02  # Wellbeing supports warmth
+                new_value -= cortisol_stress * 0.02  # Stress inhibits warmth
+                new_value -= anxiety_level * 0.02  # Anxiety inhibits openness
+                new_value -= frustration_level * 0.02  # Frustration inhibits affection
+
+            elif field == "confidence":
+                new_value += testosterone_drive * 0.03  # Testosterone boosts confidence
+                new_value += dopamine_reward * 0.02  # Success builds confidence
+                new_value += serotonin_wellbeing * 0.02  # Mood stability supports confidence
+                new_value -= cortisol_stress * 0.03  # Stress undermines confidence
+                new_value -= anxiety_level * 0.04  # Anxiety undermines confidence
+                new_value -= frustration_level * 0.02  # Frustration undermines confidence
+                new_value += contentment_level * 0.02  # Contentment supports confidence
+
+            elif field == "confusion":
+                new_value += cortisol_stress * 0.02  # Stress causes mental fog
+                new_value += melatonin_fatigue * 0.03  # Fatigue causes confusion
+                new_value -= dopamine_reward * 0.02  # Clear reward reduces confusion
+                new_value -= serotonin_wellbeing * 0.02  # Wellbeing supports clarity
+                new_value += anxiety_level * 0.02  # Anxiety clouds thinking
+                new_value -= confidence_level * 0.02  # Confidence reduces confusion
+
+            elif field == "boredom":
+                new_value -= dopamine_reward * 0.04  # Reward stimulation cures boredom
+                new_value -= excitement_level * 0.03  # Excitement opposes boredom
+                new_value += melatonin_fatigue * 0.02  # Fatigue can feel like boredom
+                new_value -= adrenaline_arousal * 0.02  # Arousal opposes boredom
+                new_value -= testosterone_drive * 0.02  # Drive opposes boredom
+                new_value += contentment_level * 0.01  # Too much contentment → boredom
+
+            elif field == "anticipation":
+                new_value += dopamine_reward * 0.03  # Dopamine drives anticipation
+                new_value += excitement_level * 0.02  # Excitement feeds anticipation
+                new_value -= anxiety_level * 0.01  # Anxiety can dampen positive anticipation
+                new_value -= boredom_level * 0.02  # Boredom has nothing to anticipate
+                new_value += testosterone_drive * 0.01  # Drive supports anticipation
+
+            # ============================================
+            # CONCEPTUAL STATE FEEDBACK LOOPS
+            # ============================================
+            elif field == "novelty":
+                new_value += dopamine_reward * 0.02  # Dopamine seeks novelty
+                new_value += excitement_level * 0.02  # Excitement from novelty
+                new_value -= boredom_level * 0.02  # Boredom craves novelty (but depletes it)
+                new_value += testosterone_drive * 0.01  # Drive seeks new experiences
+
+            elif field == "curiosity":
+                new_value += dopamine_reward * 0.03  # Dopamine drives curiosity
+                new_value -= anxiety_level * 0.02  # Anxiety inhibits exploration
+                new_value -= melatonin_fatigue * 0.02  # Fatigue reduces curiosity
+                new_value += testosterone_drive * 0.01  # Drive supports exploration
+                new_value -= boredom_level * 0.01  # Boredom can spark curiosity
+                new_value += confidence_level * 0.02  # Confidence supports exploration
+
+            elif field == "patience":
+                new_value += serotonin_wellbeing * 0.03  # Wellbeing supports patience
+                new_value += progesterone_calm * 0.02  # Calm supports patience
+                new_value -= cortisol_stress * 0.03  # Stress depletes patience
+                new_value -= frustration_level * 0.04  # Frustration depletes patience
+                new_value -= adrenaline_arousal * 0.02  # Arousal reduces patience
+                new_value += contentment_level * 0.02  # Contentment supports patience
+                new_value -= anxiety_level * 0.02  # Anxiety depletes patience
 
             setattr(self, field, _clamp(new_value))
 

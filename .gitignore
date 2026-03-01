@@ -52,6 +52,7 @@ dmypy.json
 
 # Data directories
 sel_data/
+sel_model_dataset/
 project_echo/data/
 project_echo/tmp_him/
 him_store/
@@ -111,3 +112,4 @@ user_profiles.json
 
 # Pre-commit
 .pre-commit-config.yaml.backup
+.aider*

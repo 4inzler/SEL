@@ -29,8 +29,8 @@ fi
 export HOST_UID HOST_GID HOST_USER HOST_HOME
 export DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR DBUS_RUNTIME_DIR HIM_PORT
 
-echo "[start_sel] Building sel-service image"
-docker-compose build sel-service
+echo "[start_sel] Building sel-bot image"
+docker-compose build sel-bot
 
 echo "[start_sel] Bringing up Sel/HIM stack (docker-compose up)"
 docker-compose up

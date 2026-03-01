@@ -15,7 +15,6 @@ import datetime as dt
 import hashlib
 import json
 import logging
-import math
 import re
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -76,7 +75,8 @@ def _token_hash(token: str) -> float:
     return int.from_bytes(digest, "little") / 2**32
 
 
-def generate_embedding(text: str, dim: int = 12) -> List[float]:
+def generate_embedding_local(text: str, dim: int = 64) -> List[float]:
+    """64-dim local embedding using unigrams + bigrams for better semantic coverage."""
     tokens = text.lower().split()
     if not tokens:
         return [0.0] * dim
@@ -84,11 +84,20 @@ def generate_embedding(text: str, dim: int = 12) -> List[float]:
     for tok in tokens:
         idx = int(_token_hash(tok) * dim) % dim
         vector[idx] += 1.0
+    # Bigrams capture short-range co-occurrence patterns
+    for i in range(len(tokens) - 1):
+        bigram = tokens[i] + "_" + tokens[i + 1]
+        idx = int(_token_hash(bigram) * dim) % dim
+        vector[idx] += 0.5
     norm = (sum(x * x for x in vector) or 1.0) ** 0.5
     return [x / norm for x in vector]
 
 
 def embedding_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    if len(a) != len(b):
+        # Dimension mismatch (e.g. old 12-dim vs new 64-dim or 1536-dim API vectors).
+        # Fall back to 0.0 so retrieval scores by salience + recency only.
+        return 0.0
     return sum(x * y for x, y in zip(a, b))
 
 
@@ -138,31 +147,7 @@ def _encode_payload_vector(
     salience: float,
     timestamp: dt.datetime,
 ) -> bytes:
-    """
-    Encode memory content as a small vector scene: circles on a unit canvas representing the embedding,
-    plus metadata preserved for decoding. Kept JSON-based but intentionally used as a vector payload type.
-    """
-
-    shapes = []
-    dims = list(embedding)
-    for idx, value in enumerate(dims):
-        radius = max(0.05, min(0.4, abs(value) * 0.6))
-        angle = (idx / max(1, len(dims))) * 2 * math.pi
-        cx = 0.5 + math.cos(angle) * 0.3 * value
-        cy = 0.5 + math.sin(angle) * 0.3 * value
-        intensity = max(0.0, min(1.0, (value + 1) / 2))
-        color = f"#{int(255 * intensity):02x}{int(180 * (1 - intensity)):02x}{int(200 * salience):02x}"
-        shapes.append(
-            {
-                "kind": "circle",
-                "center": [cx, cy],
-                "radius": radius,
-                "stroke": color,
-                "fill": color,
-                "weight": salience,
-            }
-        )
-
+    """Encode memory content as a compact JSON payload for HIM tile storage."""
     payload = {
         "format": "episodic_vector_v1",
         "summary": summary,
@@ -170,7 +155,6 @@ def _encode_payload_vector(
         "embedding": list(embedding),
         "salience": float(salience),
         "timestamp": timestamp.isoformat(),
-        "shapes": shapes,
     }
     return json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
 
@@ -191,6 +175,7 @@ class MemoryManager:
         max_level: int = 3,
         provenance: Optional[SnapshotProvenance] = None,
         store: HierarchicalImageMemory | None = None,
+        llm_client=None,
     ) -> None:
         self.state_manager = state_manager
         self.store = store or HierarchicalImageMemory(Path(him_root))
@@ -200,9 +185,10 @@ class MemoryManager:
             model="sel-memory",
             code_sha="local",
         )
-        # Deduplication cache: store recent memory hashes to prevent duplicates
-        # Format: {(channel_id, summary_hash): timestamp}
-        self._recent_memories: dict[tuple[str, str], dt.datetime] = {}
+        self._llm_client = llm_client
+        # O(1) in-process dedup: bounded hash set (500 entries, LRU-style eviction)
+        self._seen_hashes: set[str] = set()
+        self._seen_order: list[str] = []
 
     async def maybe_store(
         self,
@@ -214,80 +200,64 @@ class MemoryManager:
     ) -> EpisodicMemory:
         """
         Store a summary across the HIM pyramid and return an in-memory representation.
-        """
 
+        Dedup is O(1) via an in-process SHA-256 hash set (resets on restart).
+        Embeddings are fetched from the API when llm_client is available, falling
+        back to a local 64-dim bigram+unigram vector otherwise.
+        """
         # SECURITY: Sanitize HTML/JavaScript before storing in vector database
         summary = _sanitize_html(summary)
 
-        return self._store_sync(
-            channel_id,
-            summary,
-            tags or (),
-            salience,
-            timestamp,
-        )
+        if self._is_duplicate(summary):
+            logger.info("Skipping duplicate memory (in-memory hash): %s", summary[:50])
+            return EpisodicMemory(
+                channel_id=str(channel_id),
+                summary=summary,
+                tags=list(tags or ()),
+                embedding=[],
+                salience=salience,
+                timestamp=timestamp or _now(),
+            )
+
+        self._record_seen(summary)
+        embedding = await self._get_embedding(summary)
+        return self._store_sync(channel_id, summary, tags or (), embedding, salience, timestamp)
+
+    def _is_duplicate(self, summary: str) -> bool:
+        h = hashlib.sha256(summary.encode()).hexdigest()[:20]
+        return h in self._seen_hashes
+
+    def _record_seen(self, summary: str) -> None:
+        h = hashlib.sha256(summary.encode()).hexdigest()[:20]
+        if h not in self._seen_hashes:
+            self._seen_hashes.add(h)
+            self._seen_order.append(h)
+            if len(self._seen_order) > 500:
+                self._seen_hashes.discard(self._seen_order.pop(0))
+
+    async def _get_embedding(self, text: str) -> List[float]:
+        if self._llm_client is not None and hasattr(self._llm_client, "get_embedding"):
+            try:
+                return await self._llm_client.get_embedding(text)
+            except Exception as exc:
+                logger.warning("Embedding API failed, using local fallback: %s", exc)
+        return generate_embedding_local(text)
 
     def _store_sync(
         self,
         channel_id: str,
         summary: str,
         tags: Iterable[str],
+        embedding: List[float],
         salience: float,
         timestamp: dt.datetime | None = None,
     ) -> EpisodicMemory:
         snapshot_id = str(channel_id)
-        embedding = generate_embedding(summary)
         if timestamp is None:
             timestamp = _now()
         elif timestamp.tzinfo is None:
-            # Ensure timezone-aware
             timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
 
-        # Persistent deduplication: check database for identical summary in last 24 hours
-        if self.store.snapshot_exists(snapshot_id):
-            cutoff_time = timestamp - dt.timedelta(hours=24)
-            existing_tiles = self.store.tiles_for_snapshot(
-                snapshot_id,
-                stream=self.stream,
-                level_range=(0, 0),  # Only check L0 (base level)
-            )
-
-            # Check if any recent tile has the same summary
-            for tile_meta in existing_tiles:
-                try:
-                    stored_tile = self.store.get_tile(tile_meta.tile_id)
-                    payload = _decode_payload_vector(stored_tile.payload_path.read_bytes())
-                    if isinstance(payload, dict):
-                        existing_summary = payload.get('summary', '')
-                        existing_timestamp_str = payload.get('timestamp')
-
-                        if existing_summary == summary and existing_timestamp_str:
-                            try:
-                                existing_timestamp = dt.datetime.fromisoformat(existing_timestamp_str)
-                                if existing_timestamp > cutoff_time:
-                                    logger.info(f"Skipping duplicate memory (found in DB): {summary[:50]}")
-                                    return EpisodicMemory(
-                                        channel_id=snapshot_id,
-                                        summary=summary,
-                                        tags=list(tags),
-                                        embedding=list(embedding),
-                                        salience=salience,
-                                        timestamp=existing_timestamp,
-                                    )
-                            except (ValueError, TypeError):
-                                pass
-                except Exception:
-                    continue
-
-        # Clean in-memory cache (keep last 100, remove entries older than 5 minutes)
-        cutoff = timestamp - dt.timedelta(minutes=5)
-        self._recent_memories = {
-            k: v for k, v in self._recent_memories.items()
-            if v > cutoff
-        }
-        if len(self._recent_memories) > 100:
-            sorted_items = sorted(self._recent_memories.items(), key=lambda x: x[1], reverse=True)
-            self._recent_memories = dict(sorted_items[:100])
         payload_bytes = _encode_payload_vector(
             summary=summary,
             tags=tags,
@@ -318,18 +288,23 @@ class MemoryManager:
         """
         Query hierarchical tiles for the closest episodic memories.
         """
+        query_vec = await self._get_embedding(query)
+        return self._retrieve_sync(channel_id, query, query_vec, limit)
 
-        return self._retrieve_sync(channel_id, query, limit)
+    async def retrieve_recent(self, channel_id: str, limit: int = 10) -> List[EpisodicMemory]:
+        """
+        Retrieve the most recent memories by timestamp (no semantic query).
+        """
 
-    def _retrieve_sync(self, channel_id: str, query: str, limit: int) -> List[EpisodicMemory]:
+        return self._retrieve_recent_sync(channel_id, limit)
+
+    def _retrieve_sync(self, channel_id: str, query: str, query_vec: List[float], limit: int) -> List[EpisodicMemory]:
         snapshot_id = str(channel_id)
         if not self.store.snapshot_exists(snapshot_id):
             return []
 
         # Extract keywords from query for fast filtering
         keywords = [w.lower() for w in query.split() if len(w) > 3][:5]  # Top 5 words > 3 chars
-
-        query_vec = generate_embedding(query)
         seen: set[str] = set()
         seen_summaries: set[str] = set()  # Deduplicate by content
         candidates: list[tuple[float, EpisodicMemory]] = []
@@ -406,7 +381,7 @@ class MemoryManager:
         now = datetime.now(timezone.utc)
 
         for mem, level in all_memories:
-            similarity = embedding_similarity(query_vec, mem.embedding or generate_embedding(mem.summary))
+            similarity = embedding_similarity(query_vec, mem.embedding or generate_embedding_local(mem.summary))
             score = similarity
             score += (mem.salience or 0.5) * 0.2
             score += level * 0.05
@@ -430,6 +405,36 @@ class MemoryManager:
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         return [mem for _, mem in candidates[:limit]]
+
+    def _retrieve_recent_sync(self, channel_id: str, limit: int) -> List[EpisodicMemory]:
+        snapshot_id = str(channel_id)
+        if not self.store.snapshot_exists(snapshot_id):
+            return []
+
+        seen_summaries: set[str] = set()
+        memories: list[EpisodicMemory] = []
+
+        for level in range(self.max_level, -1, -1):
+            metas = self.store.tiles_for_snapshot(
+                snapshot_id,
+                stream=self.stream,
+                level_range=(level, level),
+            )
+            for meta in metas:
+                try:
+                    stored = self.store.get_tile(meta.tile_id)
+                    payload_bytes = _decode_payload_vector(stored.payload_path.read_bytes())
+                    payload = payload_bytes if isinstance(payload_bytes, dict) else {}
+                except Exception:
+                    continue
+                mem = self._payload_to_memory(channel_id, payload)
+                if mem.summary in seen_summaries:
+                    continue
+                seen_summaries.add(mem.summary)
+                memories.append(mem)
+
+        memories.sort(key=lambda m: m.timestamp or _now(), reverse=True)
+        return memories[:limit]
 
     def _build_tile_records(
         self,
@@ -476,7 +481,7 @@ class MemoryManager:
         summary = str(payload.get("summary") or "").strip()
         tags = payload.get("tags") or []
         salience = float(payload.get("salience", 0.5))
-        embedding = payload.get("embedding") or generate_embedding(summary)
+        embedding = payload.get("embedding") or generate_embedding_local(summary)
         ts_raw = payload.get("timestamp")
         timestamp: dt.datetime | None = None
         if isinstance(ts_raw, str):

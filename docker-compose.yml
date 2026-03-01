@@ -1,8 +1,6 @@
 # SEL Discord Bot - SANDBOXED VERSION
 # No shell access, no host filesystem access, completely isolated
 
-version: '3.8'
-
 services:
   sel-bot:
     build:
@@ -14,40 +12,24 @@ services:
     # SECURITY: Run as non-root user
     user: "1000:1000"
 
-    # SECURITY: Maximum hardening
+    # SECURITY: Hardening
     security_opt:
       - no-new-privileges:true
-      - apparmor=docker-default
-      - seccomp=./seccomp-profile.json
     cap_drop:
       - ALL
-    # NO capabilities added - not even NET_BIND_SERVICE
 
-    # SECURITY: Read-only root filesystem
-    read_only: true
+    # Writable tmp for Python
     tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=100m
+      - /tmp:rw,size=100m
 
-    # SECURITY: Strict resource limits (prevent DoS)
+    # Resource limits
     mem_limit: 2g
     mem_reservation: 512m
     cpus: 2
-    pids_limit: 100
-    ulimits:
-      nproc: 100
-      nofile:
-        soft: 1024
-        hard: 2048
 
-    # SECURITY: Prevent privilege escalation
-    privileged: false
-    ipc: private
-
-    # SECURITY: Network - No listening ports exposed
-    # Only outbound connections allowed (Discord API, OpenRouter API)
-    ports: []  # NO ports exposed
-    expose: []  # NO ports exposed to other containers
-    network_mode: bridge
+    # HIM API port (optional - enable if you need external access to memory API)
+    ports:
+      - "8000:8000"  # HIM API
 
     # SECURITY: Only data directory is writable (isolated from host)
     volumes:
@@ -69,17 +51,85 @@ services:
       OPENROUTER_MAIN_TEMP: ${OPENROUTER_MAIN_TEMP:-0.8}
       OPENROUTER_UTIL_TEMP: ${OPENROUTER_UTIL_TEMP:-0.3}
 
-      # LocalAI (optional alternative)
+      # ElevenLabs TTS/STT
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_BASE_URL: ${ELEVENLABS_BASE_URL:-https://api.elevenlabs.io}
+      ELEVENLABS_TTS_ENABLED: ${ELEVENLABS_TTS_ENABLED:-false}
+      ELEVENLABS_TTS_MODEL: ${ELEVENLABS_TTS_MODEL:-eleven_multilingual_v2}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+      ELEVENLABS_TTS_OUTPUT_FORMAT: ${ELEVENLABS_TTS_OUTPUT_FORMAT:-mp3_44100_128}
+      ELEVENLABS_TTS_LANGUAGE_CODE: ${ELEVENLABS_TTS_LANGUAGE_CODE:-}
+      ELEVENLABS_TTS_ENABLE_LOGGING: ${ELEVENLABS_TTS_ENABLE_LOGGING:-true}
+      ELEVENLABS_TTS_MAX_CHARS: ${ELEVENLABS_TTS_MAX_CHARS:-600}
+      ELEVENLABS_STT_ENABLED: ${ELEVENLABS_STT_ENABLED:-false}
+      ELEVENLABS_STT_MODEL: ${ELEVENLABS_STT_MODEL:-scribe_v1}
+      ELEVENLABS_STT_LANGUAGE_CODE: ${ELEVENLABS_STT_LANGUAGE_CODE:-}
+      ELEVENLABS_STT_ENABLE_LOGGING: ${ELEVENLABS_STT_ENABLE_LOGGING:-true}
+      ELEVENLABS_STT_MAX_BYTES: ${ELEVENLABS_STT_MAX_BYTES:-10000000}
+      PIPER_TTS_ENABLED: ${PIPER_TTS_ENABLED:-false}
+      PIPER_TTS_MODEL: ${PIPER_TTS_MODEL:-en_US-lessac-medium}
+      PIPER_TTS_DATA_DIR: ${PIPER_TTS_DATA_DIR:-/data/piper}
+      PIPER_TTS_DOWNLOAD_DIR: ${PIPER_TTS_DOWNLOAD_DIR:-/data/piper}
+      LOCAL_TTS_ENABLED: ${LOCAL_TTS_ENABLED:-false}
+      LOCAL_TTS_VOICE: ${LOCAL_TTS_VOICE:-en-us}
+
+      # Voice auto-leave behavior
+      VOICE_AUTO_LEAVE_ENABLED: ${VOICE_AUTO_LEAVE_ENABLED:-true}
+      VOICE_AUTO_LEAVE_CHECK_SECONDS: ${VOICE_AUTO_LEAVE_CHECK_SECONDS:-30}
+      VOICE_AUTO_LEAVE_EMPTY_MINUTES: ${VOICE_AUTO_LEAVE_EMPTY_MINUTES:-3}
+      VOICE_AUTO_LEAVE_HORMONE_ENABLED: ${VOICE_AUTO_LEAVE_HORMONE_ENABLED:-true}
+      VOICE_AUTO_LEAVE_MELATONIN_MIN: ${VOICE_AUTO_LEAVE_MELATONIN_MIN:-0.7}
+      VOICE_AUTO_LEAVE_DOPAMINE_MAX: ${VOICE_AUTO_LEAVE_DOPAMINE_MAX:-0.25}
+      VOICE_LEAVE_PHRASES: ${VOICE_LEAVE_PHRASES:-}
+      VOICE_STT_ENABLED: ${VOICE_STT_ENABLED:-false}
+      VOICE_STT_AUTO_RESPOND: ${VOICE_STT_AUTO_RESPOND:-true}
+      VOICE_STT_POST_TRANSCRIPTS: ${VOICE_STT_POST_TRANSCRIPTS:-false}
+      VOICE_STT_SILENT_TEXT: ${VOICE_STT_SILENT_TEXT:-false}
+      VOICE_ONLY_RESPONSES: ${VOICE_ONLY_RESPONSES:-false}
+      VOICE_STT_MIN_SECONDS: ${VOICE_STT_MIN_SECONDS:-0.6}
+      VOICE_STT_MAX_SECONDS: ${VOICE_STT_MAX_SECONDS:-15.0}
+      VOICE_STT_SAMPLE_RATE: ${VOICE_STT_SAMPLE_RATE:-48000}
+      VOICE_STT_CHANNELS: ${VOICE_STT_CHANNELS:-2}
+
+      # LLM provider selection
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+
+      # LocalAI / LMStudio (OpenAI-compatible local server)
       LOCALAI_BASE_URL: ${LOCALAI_BASE_URL:-http://localai:8080}
-      LOCALAI_API_KEY: ${LOCALAI_API_KEY:-}
+      LOCALAI_API_KEY: ${LOCALAI_API_KEY:-lm-studio}
+      LOCALAI_MAIN_MODEL: ${LOCALAI_MAIN_MODEL:-gpt-4}
+      LOCALAI_UTIL_MODEL: ${LOCALAI_UTIL_MODEL:-gpt-3.5-turbo}
+      LOCALAI_VISION_MODEL: ${LOCALAI_VISION_MODEL:-llava}
+      LOCALAI_MAIN_TEMP: ${LOCALAI_MAIN_TEMP:-0.8}
+      LOCALAI_UTIL_TEMP: ${LOCALAI_UTIL_TEMP:-0.3}
 
       # Database
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://sel:sel@db:5432/sel}
 
       # HIM Memory
       HIM_ENABLED: ${HIM_ENABLED:-1}
+      SEL_DATA_DIR: /data
+      SEL_MODEL_DATASET_DIR: /data/sel_model_dataset
       HIM_DATA_DIR: /data
       HIM_MEMORY_DIR: /data/him_store
+      HIM_API_ENABLED: ${HIM_API_ENABLED:-true}
+      HIM_API_HOST: "0.0.0.0"
+      HIM_API_PORT: 8000
+
+      # System operator mode
+      SEL_OPERATOR_MODE_ENABLED: ${SEL_OPERATOR_MODE_ENABLED:-false}
+      SEL_OPERATOR_FULL_HOST_PRIVILEGES: ${SEL_OPERATOR_FULL_HOST_PRIVILEGES:-false}
+      SEL_OPERATOR_REQUIRE_APPROVAL_USER: ${SEL_OPERATOR_REQUIRE_APPROVAL_USER:-true}
+      SEL_OPERATOR_COMMAND_TIMEOUT_SECONDS: ${SEL_OPERATOR_COMMAND_TIMEOUT_SECONDS:-45}
+      SEL_OPERATOR_MAX_OUTPUT_CHARS: ${SEL_OPERATOR_MAX_OUTPUT_CHARS:-6000}
+      SEL_OPERATOR_COMMAND_INTENT_THRESHOLD: ${SEL_OPERATOR_COMMAND_INTENT_THRESHOLD:-0.60}
+      SEL_OPERATOR_DIRECT_REPLY_ENABLED: ${SEL_OPERATOR_DIRECT_REPLY_ENABLED:-false}
+      SEL_OPERATOR_BLOCK_PATTERNS: ${SEL_OPERATOR_BLOCK_PATTERNS:-}
+      APPROVAL_USER_ID: ${APPROVAL_USER_ID:-}
+      RESPONSE_FAST_MODE_ENABLED: ${RESPONSE_FAST_MODE_ENABLED:-true}
+      RESPONSE_FAST_MODE_MAX_USER_CHARS: ${RESPONSE_FAST_MODE_MAX_USER_CHARS:-220}
+      RESPONSE_FAST_MODE_SKIP_CLASSIFICATION_CHARS: ${RESPONSE_FAST_MODE_SKIP_CLASSIFICATION_CHARS:-90}
+      RESPONSE_FAST_MODE_MEMORY_RECALL_LIMIT: ${RESPONSE_FAST_MODE_MEMORY_RECALL_LIMIT:-18}
 
       # Python
       PYTHONUNBUFFERED: 1

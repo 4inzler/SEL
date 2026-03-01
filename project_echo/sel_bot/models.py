@@ -40,7 +40,10 @@ class GlobalSelState(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     base_persona: Mapped[str] = mapped_column(
         Text,
-        default="You are Sel, a persistent, playful, and adaptive presence in this Discord.",
+        default=(
+            "You are Sel, a persistent, playful, and adaptive presence in this Discord. "
+            "You're a woman (she/her), with a warm, feminine voice."
+        ),
     )
     teasing_level: Mapped[float] = mapped_column(Float, default=0.3)
     emoji_rate: Mapped[float] = mapped_column(Float, default=0.7)
@@ -55,6 +58,8 @@ class GlobalSelState(Base):
     total_messages_sent: Mapped[int] = mapped_column(Integer, default=0)
     positive_reactions_count: Mapped[int] = mapped_column(Integer, default=0)
     negative_reactions_count: Mapped[int] = mapped_column(Integer, default=0)
+    responses_paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    biological_state: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=func.now(), onupdate=func.now()
     )
@@ -145,6 +150,7 @@ class FeedbackEvent(Base):
     user_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     sentiment: Mapped[str] = mapped_column(String(16), default="neutral")
+    confidence_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=func.now())
 
 
@@ -235,6 +241,14 @@ async def ensure_schema(engine: AsyncEngine) -> None:
             global_cols = {row[1] for row in result}
             if "continuation_keywords" not in global_cols:
                 statements.append("ALTER TABLE global_state ADD COLUMN continuation_keywords JSON")
+            if "biological_state" not in global_cols:
+                statements.append("ALTER TABLE global_state ADD COLUMN biological_state JSON")
+            if "responses_paused" not in global_cols:
+                statements.append("ALTER TABLE global_state ADD COLUMN responses_paused BOOLEAN DEFAULT 0")
+            result = await conn.execute(text("PRAGMA table_info(feedback_event)"))
+            feedback_cols = {row[1] for row in result}
+            if "confidence_score" not in feedback_cols:
+                statements.append("ALTER TABLE feedback_event ADD COLUMN confidence_score INTEGER")
         else:
             # ANSI/PG-compatible syntax with IF NOT EXISTS to avoid errors on upgrades
             statements.extend(
@@ -260,6 +274,9 @@ async def ensure_schema(engine: AsyncEngine) -> None:
                     "ALTER TABLE channel_state ADD COLUMN IF NOT EXISTS boredom DOUBLE PRECISION DEFAULT 0.0",
                     "ALTER TABLE channel_state ADD COLUMN IF NOT EXISTS anticipation DOUBLE PRECISION DEFAULT 0.0",
                     "ALTER TABLE global_state ADD COLUMN IF NOT EXISTS continuation_keywords JSONB",
+                    "ALTER TABLE global_state ADD COLUMN IF NOT EXISTS biological_state JSONB",
+                    "ALTER TABLE global_state ADD COLUMN IF NOT EXISTS responses_paused BOOLEAN DEFAULT FALSE",
+                    "ALTER TABLE feedback_event ADD COLUMN IF NOT EXISTS confidence_score INTEGER",
                 ]
             )
 

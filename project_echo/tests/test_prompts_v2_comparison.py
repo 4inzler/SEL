@@ -1,13 +1,10 @@
 """
-A/B test suite comparing original prompts.py vs enhanced prompts_v2.py
+A/B test suite comparing original prompts.py vs enhanced prompts_v2.py.
 
-Tests measure:
-1. Factual accuracy (hallucination resistance)
-2. Format compliance (structure following)
-3. Uncertainty calibration (appropriate confidence)
-4. Consistency (cross-message coherence)
-5. Tone appropriateness (context matching)
-6. Personality preservation (still sounds like Sel)
+NOTE: These tests validate PROMPT STRUCTURE, not LLM behavior.
+They verify that certain instructions/keywords are present in prompts.
+To validate actual behavioral outcomes (hallucinations, tone, etc.),
+run LLM evals with representative interactions.
 
 Run with: pytest project_echo/tests/test_prompts_v2_comparison.py -v
 """
@@ -267,7 +264,7 @@ TEST_SCENARIOS = [
 
 
 class TestPromptV2Quality:
-    """Test that v2 prompts improve quality without sacrificing personality"""
+    """Validate that v2 prompt structure carries expected quality guidance"""
 
     def _build_messages_wrapper(self, version: str, scenario: TestScenario,
                                 global_state: GlobalSelState, channel_state: ChannelState,
@@ -289,9 +286,14 @@ class TestPromptV2Quality:
         )
 
     @pytest.mark.parametrize("scenario", TEST_SCENARIOS)
-    def test_prompt_structure_v2(self, scenario: TestScenario, baseline_global_state: GlobalSelState,
-                                 neutral_channel_state: ChannelState, standard_user: UserState):
-        """Test that v2 builds valid message structure"""
+    def test_prompt_structure_v2_includes_expected_sections(
+        self,
+        scenario: TestScenario,
+        baseline_global_state: GlobalSelState,
+        neutral_channel_state: ChannelState,
+        standard_user: UserState,
+    ):
+        """Ensure v2 prompt includes structural sections and guardrails"""
         messages = self._build_messages_wrapper(
             "v2", scenario, baseline_global_state, neutral_channel_state, standard_user
         )
@@ -307,10 +309,13 @@ class TestPromptV2Quality:
         assert "RESPONSE_EXAMPLES" in content_combined
         assert "RESPONSE_PROCESS" in content_combined
 
-    def test_v2_preserves_personality_elements(self, baseline_global_state: GlobalSelState,
-                                                neutral_channel_state: ChannelState,
-                                                standard_user: UserState):
-        """Ensure v2 doesn't lose Sel's core personality"""
+    def test_v2_prompt_includes_personality_markers(
+        self,
+        baseline_global_state: GlobalSelState,
+        neutral_channel_state: ChannelState,
+        standard_user: UserState,
+    ):
+        """Ensure v2 prompt explicitly carries core personality markers"""
         scenario = TestScenario(
             name="personality check",
             user_message="hey what's up",
@@ -333,19 +338,22 @@ class TestPromptV2Quality:
 
         # Core personality markers should be preserved
         personality_markers = [
-            "Talk like you're texting a friend",
-            "yeah", "kinda", "tbh", "ngl",
-            "be yourself, not a chatbot",
-            "systematic emotional logic"
+            "Text like you're messaging someone you actually know",
+            "Contractions aren't optional",
+            "React honestly",
+            "GOLDEN RULE: You're a real person texting",
         ]
 
         for marker in personality_markers:
             assert marker in v2_content, f"v2 lost personality marker: {marker}"
 
-    def test_v2_adds_quality_guardrails(self, baseline_global_state: GlobalSelState,
-                                       neutral_channel_state: ChannelState,
-                                       standard_user: UserState):
-        """Verify v2 includes constitutional AI and scaffolding"""
+    def test_v2_prompt_includes_quality_guardrails(
+        self,
+        baseline_global_state: GlobalSelState,
+        neutral_channel_state: ChannelState,
+        standard_user: UserState,
+    ):
+        """Verify v2 prompt text includes constitutional guardrails"""
         scenario = TestScenario(
             name="guardrails check",
             user_message="test",
@@ -376,10 +384,13 @@ class TestPromptV2Quality:
         assert "CONSISTENCY" in v2_content
         assert "UNCERTAINTY CALIBRATION" in v2_content
 
-    def test_cognitive_scaffolding_adapts_to_context(self, baseline_global_state: GlobalSelState,
-                                                     neutral_channel_state: ChannelState,
-                                                     standard_user: UserState):
-        """Verify scaffolding mentions memories when present, images when present, etc."""
+    def test_cognitive_scaffolding_mentions_available_context(
+        self,
+        baseline_global_state: GlobalSelState,
+        neutral_channel_state: ChannelState,
+        standard_user: UserState,
+    ):
+        """Verify scaffolding text references available context/memories"""
 
         # Scenario WITH memories and recent context
         scenario_rich = TestScenario(
@@ -477,7 +488,7 @@ class TestEndToEndComparison:
 
 
 class TestPromptTokenEfficiency:
-    """Test that v2 doesn't explode token counts"""
+    """Check prompt size remains within reasonable structural bounds"""
 
     def _build_messages_wrapper(self, version: str, scenario: TestScenario,
                                 global_state: GlobalSelState, channel_state: ChannelState,

@@ -28,8 +28,10 @@ class StateManager:
 
     async def ensure_global_state(self) -> GlobalSelState:
         async with self.session() as session:
-            result = await session.execute(select(GlobalSelState))
-            state = result.scalar_one_or_none()
+            result = await session.execute(select(GlobalSelState).order_by(GlobalSelState.id.asc()))
+            states = list(result.scalars().all())
+            state = states[0] if states else None
+
             if state is None:
                 state = GlobalSelState(
                     base_persona=self.persona_seed or GlobalSelState().base_persona,
@@ -38,7 +40,16 @@ class StateManager:
                 session.add(state)
                 await session.commit()
                 await session.refresh(state)
-            elif not getattr(state, "continuation_keywords", None) and self.default_continuation_keywords:
+                return state
+
+            # Cleanup: ensure single global row
+            if len(states) > 1:
+                for extra in states[1:]:
+                    await session.delete(extra)
+                await session.commit()
+                await session.refresh(state)
+
+            if not getattr(state, "continuation_keywords", None) and self.default_continuation_keywords:
                 state.continuation_keywords = list(self.default_continuation_keywords)
                 await session.merge(state)
                 await session.commit()
@@ -112,6 +123,7 @@ class StateManager:
         user_id: Optional[str],
         latency_ms: int,
         sentiment: str,
+        confidence_score: Optional[int] = None,
     ) -> FeedbackEvent:
         async with self.session() as session:
             event = FeedbackEvent(
@@ -120,8 +132,21 @@ class StateManager:
                 user_id=user_id,
                 latency_ms=latency_ms,
                 sentiment=sentiment,
+                confidence_score=confidence_score,
             )
             session.add(event)
             await session.commit()
             await session.refresh(event)
             return event
+
+    async def list_confidence_scores(self, limit: int = 200) -> list[int]:
+        """Return recent confidence scores (most recent last) across all channels."""
+        async with self.session() as session:
+            result = await session.execute(
+                select(FeedbackEvent.confidence_score)
+                .where(FeedbackEvent.confidence_score.is_not(None))
+                .order_by(FeedbackEvent.created_at.desc())
+                .limit(limit)
+            )
+            scores = [row[0] for row in result.fetchall() if row[0] is not None]
+            return list(reversed(scores))

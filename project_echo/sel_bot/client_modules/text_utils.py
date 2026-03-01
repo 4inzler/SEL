@@ -189,7 +189,7 @@ def match_agent_request(content: str, agent_names: list[str]) -> Optional[tuple[
             after = lower.split(f"run {key}", 1)[1].strip()
             return name, after or content
         if f"{key} agent" in lower:
-            after = lower.split(f"{key} agent}", 1)[1].strip()
+            after = lower.split(f"{key} agent", 1)[1].strip()
             return name, after or content
         if f"{key} tool" in lower:
             after = lower.split(f"{key} tool", 1)[1].strip()

@@ -5,7 +5,7 @@ WORKDIR /app/project_echo
 
 COPY project_echo /app/project_echo
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends playerctl dbus fastfetch \
+    && apt-get install -y --no-install-recommends playerctl dbus fastfetch ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .

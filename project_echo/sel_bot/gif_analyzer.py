@@ -12,7 +12,17 @@ from pathlib import Path
 from typing import List, Optional
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
+
+from .media_utils import looks_like_gif_url
+from .vision_analysis import (
+    VisionAnalysis,
+    apply_text_override,
+    compact_multiline,
+    dedupe_preserve_order,
+    render_vision_analysis,
+    truncate_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +62,7 @@ class GifAnalyzer:
 
     def extract_frames(self, gif_data: bytes) -> List[Image.Image]:
         """
-        Extract key frames from GIF data.
+        Extract key frames from GIF data using change-based sampling.
 
         Args:
             gif_data: GIF file data as bytes
@@ -75,31 +85,141 @@ class GifAnalyzer:
 
             logger.info(f"GIF has {total_frames} total frames")
 
-            # Calculate which frames to extract
             if total_frames <= self.max_frames:
-                # If few frames, take them all
                 frame_indices = list(range(total_frames))
-            else:
-                # Sample frames evenly throughout the GIF
-                step = max(1, total_frames // self.max_frames)
-                frame_indices = list(range(0, total_frames, step))[:self.max_frames]
+                for idx in frame_indices:
+                    try:
+                        gif.seek(idx)
+                        frame = gif.convert("RGB")
+                        frames.append(frame.copy())
+                    except Exception as e:
+                        logger.warning(f"Failed to extract frame {idx}: {e}")
+                logger.info(f"Extracted {len(frames)} frames from GIF")
+                return frames
 
-            # Extract frames
-            for idx in frame_indices:
+            step = max(1, self.frame_skip)
+            candidates: list[tuple[float, int, Image.Image]] = []
+            prev_frame: Optional[Image.Image] = None
+
+            for idx in range(0, total_frames, step):
                 try:
                     gif.seek(idx)
-                    # Convert to RGB (some GIFs are in palette mode)
-                    frame = gif.convert('RGB')
-                    frames.append(frame.copy())
+                    frame = gif.convert("RGB")
+                    score = float("inf") if prev_frame is None else self._frame_diff_score(frame, prev_frame)
+                    candidates.append((score, idx, frame.copy()))
+                    prev_frame = frame
                 except Exception as e:
                     logger.warning(f"Failed to extract frame {idx}: {e}")
 
-            logger.info(f"Extracted {len(frames)} frames from GIF")
+            last_idx = total_frames - 1
+            if last_idx % step != 0:
+                try:
+                    gif.seek(last_idx)
+                    frame = gif.convert("RGB")
+                    score = float("inf") if prev_frame is None else self._frame_diff_score(frame, prev_frame)
+                    candidates.append((score, last_idx, frame.copy()))
+                except Exception as e:
+                    logger.warning(f"Failed to extract last frame {last_idx}: {e}")
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            selected: dict[int, Image.Image] = {}
+            for score, idx, frame in candidates:
+                selected[idx] = frame
+                if len(selected) >= self.max_frames:
+                    break
+
+            if 0 not in selected:
+                try:
+                    gif.seek(0)
+                    selected[0] = gif.convert("RGB").copy()
+                except Exception:
+                    pass
+            if last_idx not in selected:
+                try:
+                    gif.seek(last_idx)
+                    selected[last_idx] = gif.convert("RGB").copy()
+                except Exception:
+                    pass
+
+            frames = [selected[idx] for idx in sorted(selected)]
+            logger.info(f"Extracted {len(frames)} frames from GIF (change-based sampling)")
 
         except Exception as e:
             logger.error(f"Failed to process GIF: {e}")
 
         return frames
+
+    @staticmethod
+    def _frame_diff_score(frame_a: Image.Image, frame_b: Image.Image) -> float:
+        """Compute a simple visual difference score between frames."""
+        size = (64, 64)
+        small_a = frame_a.resize(size)
+        small_b = frame_b.resize(size)
+        diff = ImageChops.difference(small_a, small_b)
+        stat = ImageStat.Stat(diff)
+        return sum(stat.mean) / max(len(stat.mean), 1)
+
+    @staticmethod
+    def _format_list(items: list[str], max_items: int) -> str:
+        cleaned = [item.strip() for item in items if item.strip()]
+        if not cleaned:
+            return ""
+        trimmed = cleaned[:max_items]
+        extra = len(cleaned) - len(trimmed)
+        text = ", ".join(trimmed)
+        if extra > 0:
+            text = f"{text}, +{extra} more"
+        return text
+
+    def _combine_frame_analyses(
+        self,
+        analyses: list[VisionAnalysis],
+        ocr_text: Optional[str],
+    ) -> Optional[str]:
+        if not analyses:
+            return None
+
+        summaries = [compact_multiline(analysis.summary) for analysis in analyses if analysis.summary]
+        actions = dedupe_preserve_order(
+            [action for analysis in analyses for action in analysis.actions]
+        )
+        objects = dedupe_preserve_order(
+            [obj.label for analysis in analyses for obj in analysis.objects if obj.label]
+        )
+        uncertainties = dedupe_preserve_order(
+            [item for analysis in analyses for item in analysis.uncertainties]
+        )
+        setting = next((analysis.setting for analysis in analyses if analysis.setting), None)
+
+        text = ocr_text
+        if not text:
+            for analysis in analyses:
+                if analysis.text.present and analysis.text.content:
+                    text = analysis.text.content
+                    break
+
+        parts: list[str] = [f"Animated GIF ({len(analyses)} frames)"]
+        if summaries:
+            if len(summaries) <= 3:
+                parts.append(f"Frames: {' / '.join(summaries)}")
+            else:
+                parts.append(f"Frames: {' / '.join(summaries[:3])} / ...")
+        actions_text = self._format_list(actions, 6)
+        if actions_text:
+            parts.append(f"Actions: {actions_text}")
+        objects_text = self._format_list(objects, 6)
+        if objects_text:
+            parts.append(f"Objects: {objects_text}")
+        if setting:
+            parts.append(f"Setting: {truncate_text(compact_multiline(setting), 120)}")
+        if text:
+            compact = compact_multiline(text)
+            parts.append(f"Text: \"{truncate_text(compact, 160)}\"")
+        uncertainties_text = self._format_list(uncertainties, 3)
+        if uncertainties_text:
+            parts.append(f"Uncertain: {uncertainties_text}")
+
+        return " | ".join(parts)
 
     async def save_frame_as_temp(self, frame: Image.Image, format: str = "PNG") -> Optional[str]:
         """
@@ -136,7 +256,7 @@ class GifAnalyzer:
 
         Args:
             gif_url: URL to the GIF
-            llm_client: LLM client with describe_image method
+            llm_client: LLM client with analyze_image method
             describe_prompt: Prompt for frame description
 
         Returns:
@@ -158,27 +278,26 @@ class GifAnalyzer:
             try:
                 temp_path = await self.save_frame_as_temp(frames[0])
                 if temp_path:
-                    description = await llm_client.describe_image(
+                    analysis = await llm_client.analyze_image(
                         f"file://{temp_path}",
-                        prompt=describe_prompt
+                        prompt=describe_prompt,
                     )
 
                     # Extract text from the frame
                     ocr_text = await llm_client.extract_text_from_image(f"file://{temp_path}")
+                    if ocr_text:
+                        analysis = apply_text_override(analysis, ocr_text)
 
                     Path(temp_path).unlink(missing_ok=True)
 
-                    # Combine description with OCR text if found
-                    if ocr_text:
-                        return f"[Image: {description}]\n[Text in image: {ocr_text}]"
-                    else:
-                        return description
+                    caption = render_vision_analysis(analysis)
+                    return caption or analysis.summary or None
             except Exception as e:
-                logger.error(f"Failed to describe single frame: {e}")
+                logger.error(f"Failed to analyze single frame: {e}")
                 return None
 
-        # For multiple frames, describe each and combine
-        frame_descriptions = []
+        # For multiple frames, analyze each and combine
+        frame_analyses: list[VisionAnalysis] = []
         temp_files = []
         ocr_text = None
 
@@ -188,12 +307,18 @@ class GifAnalyzer:
                 if temp_path:
                     temp_files.append(temp_path)
                     try:
-                        description = await llm_client.describe_image(
+                        analysis = await llm_client.analyze_image(
                             f"file://{temp_path}",
-                            prompt=f"Frame {i+1}/{len(frames)}: {describe_prompt}"
+                            prompt=f"Frame {i+1}/{len(frames)}: {describe_prompt}",
                         )
-                        frame_descriptions.append(f"Frame {i+1}: {description}")
-                        logger.info(f"Described frame {i+1}/{len(frames)}")
+                        frame_analyses.append(analysis)
+                        if analysis.summary:
+                            logger.info(
+                                "Analyzed frame %s/%s summary=%s",
+                                i + 1,
+                                len(frames),
+                                analysis.summary[:120],
+                            )
 
                         # Extract text from the first frame only (to avoid redundant OCR calls)
                         if i == 0 and not ocr_text:
@@ -205,22 +330,10 @@ class GifAnalyzer:
                                 logger.warning(f"OCR failed on GIF frame: {ocr_error}")
 
                     except Exception as e:
-                        logger.warning(f"Failed to describe frame {i+1}: {e}")
+                        logger.warning(f"Failed to analyze frame {i+1}: {e}")
 
-            # Combine descriptions
-            if frame_descriptions:
-                combined = f"[Animated GIF with {len(frames)} frames]\n"
-
-                # Add OCR text if found
-                if ocr_text:
-                    combined += f"[Text in GIF: {ocr_text}]\n"
-
-                combined += "\n".join(frame_descriptions)
-                combined += f"\n[This appears to show: a sequence depicting {self._summarize_action(frame_descriptions)}]"
-
-                return combined
-            else:
-                return None
+            combined = self._combine_frame_analyses(frame_analyses, ocr_text)
+            return combined
 
         finally:
             # Cleanup temporary files
@@ -230,31 +343,6 @@ class GifAnalyzer:
                 except Exception:
                     pass
 
-    def _summarize_action(self, frame_descriptions: List[str]) -> str:
-        """
-        Simple heuristic to summarize what's happening across frames.
-
-        Args:
-            frame_descriptions: List of frame descriptions
-
-        Returns:
-            Summary phrase
-        """
-        # Look for common action words
-        combined_text = " ".join(frame_descriptions).lower()
-
-        if any(word in combined_text for word in ["moving", "walking", "running", "jumping"]):
-            return "movement or motion"
-        elif any(word in combined_text for word in ["changing", "transforming", "becoming"]):
-            return "transformation or change"
-        elif any(word in combined_text for word in ["dancing", "waving", "gesturing"]):
-            return "gestures or expressions"
-        elif any(word in combined_text for word in ["text", "words", "typing"]):
-            return "text or message animation"
-        elif any(word in combined_text for word in ["rotating", "spinning", "turning"]):
-            return "rotation or spinning"
-        else:
-            return "a sequence of events"
 
     def is_gif(self, url: str, content_type: Optional[str] = None) -> bool:
         """
@@ -267,8 +355,4 @@ class GifAnalyzer:
         Returns:
             True if this appears to be a GIF
         """
-        if content_type:
-            return "gif" in content_type.lower()
-
-        url_lower = url.lower()
-        return url_lower.endswith('.gif') or 'gif' in url_lower
+        return looks_like_gif_url(url, content_type)

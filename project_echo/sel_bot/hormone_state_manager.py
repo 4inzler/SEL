@@ -1,29 +1,25 @@
 """
-Hormone state management with HIM backend and in-memory cache.
+Hormone state management with HIM API backend and in-memory cache.
 
-Replaces SQLAlchemy hormone storage with HIM tiles while maintaining
-high-performance in-memory access for frequent operations.
+Uses the HIM HTTP API for persistence while maintaining high-performance
+in-memory access for frequent operations.
 
 Architecture:
 - In-memory dict cache for fast access (no I/O on decay/update)
-- Background task writes dirty entries to HIM every 5 minutes
-- On startup: load latest tiles from HIM into cache
-- Graceful degradation: cache-only mode if HIM unavailable
+- Background task writes dirty entries to HIM API every 5 minutes
+- On startup: load latest state from HIM API into cache
+- Graceful degradation: cache-only mode if HIM API unavailable
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import datetime as dt
-import json
 import logging
-import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, Optional
 
-from blake3 import blake3
+import httpx
 
 from sel_bot.hormones import HormoneVector
 
@@ -49,19 +45,19 @@ class CachedHormoneState:
 
 class HormoneStateManager:
     """
-    Manages per-channel hormone state with in-memory cache and HIM persistence.
+    Manages per-channel hormone state with in-memory cache and HIM API persistence.
 
     Architecture:
     - In-memory dict cache for fast access (no I/O on decay/update)
-    - Background task writes dirty entries to HIM every 5 minutes
-    - On startup: load latest tiles from HIM into cache
-    - Graceful degradation: cache-only mode if HIM unavailable
+    - Background task writes dirty entries to HIM API every 5 minutes
+    - On startup: load latest state from HIM API into cache
+    - Graceful degradation: cache-only mode if HIM API unavailable
 
     Example usage:
-        manager = HormoneStateManager(him_root="sel_data/him_store")
+        manager = HormoneStateManager(api_base_url="http://localhost:8000")
         await manager.start()
 
-        # Get state (from cache or HIM)
+        # Get state (from cache or HIM API)
         state = await manager.get_state("channel_123")
 
         # Update state (in-memory, marks dirty)
@@ -75,40 +71,25 @@ class HormoneStateManager:
     def __init__(
         self,
         *,
-        him_root: str | Path = Path("sel_data/him_store"),
-        max_level: int = 3,
+        api_base_url: str = "http://localhost:8000",
+        him_root: str | None = None,  # Deprecated, kept for backward compatibility
+        max_level: int = 3,  # Kept for backward compatibility
         snapshot_interval: int = SNAPSHOT_INTERVAL_SECONDS,
-        store = None,  # HierarchicalImageMemory instance
+        store=None,  # Deprecated, kept for backward compatibility
     ) -> None:
         """
         Initialize HormoneStateManager.
 
         Args:
-            him_root: Root directory for HIM storage
-            max_level: Maximum pyramid level (0 = finest, 3 = coarsest)
-            snapshot_interval: Seconds between HIM writes (default: 300 = 5 minutes)
-            store: Optional HierarchicalImageMemory instance (for testing)
+            api_base_url: Base URL for HIM API (default: http://localhost:8000)
+            him_root: Deprecated - use api_base_url instead
+            max_level: Deprecated - API handles pyramid levels
+            snapshot_interval: Seconds between API writes (default: 300 = 5 minutes)
+            store: Deprecated - use api_base_url instead
         """
-        # Lazy import to avoid circular dependencies
+        self._api_base_url = api_base_url.rstrip("/")
         self._him_available = True
-        if store is None:
-            try:
-                root_path = Path(him_root)
-                if root_path.is_absolute():
-                    if root_path.parts[:2] == ("/", "nonexistent"):
-                        raise FileNotFoundError(f"HIM root does not exist: {root_path}")
-                    if not root_path.exists():
-                        raise FileNotFoundError(f"HIM root does not exist: {root_path}")
-                from him import HierarchicalImageMemory
-                self.store = HierarchicalImageMemory(root_path)
-            except Exception as exc:
-                logger.warning("Failed to initialize HIM storage: %s - running in cache-only mode", exc)
-                self.store = None
-                self._him_available = False
-        else:
-            self.store = store
-
-        self.max_level = max(1, max_level)
+        self._http_client: Optional[httpx.AsyncClient] = None
         self.snapshot_interval = snapshot_interval
         self.stream = HORMONE_STREAM
 
@@ -124,19 +105,26 @@ class HormoneStateManager:
         self._total_flushes = 0
         self._failed_flushes = 0
 
-        # Provenance for snapshot creation
-        try:
-            from him.models import SnapshotProvenance
-            self._provenance = SnapshotProvenance(
-                model="sel-hormone-state",
-                code_sha="local",
-            )
-        except ImportError:
-            logger.warning("Could not import SnapshotProvenance, using None")
-            self._provenance = None
-
     async def start(self) -> None:
-        """Start background persistence task."""
+        """Start background persistence task and HTTP client."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                base_url=self._api_base_url,
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+            # Test API connectivity
+            try:
+                response = await self._http_client.get("/v1/snapshots", params={"limit": 1})
+                if response.status_code == 200:
+                    self._him_available = True
+                    logger.info("HIM API connected at %s", self._api_base_url)
+                else:
+                    logger.warning("HIM API returned status %d - running in cache-only mode", response.status_code)
+                    self._him_available = False
+            except Exception as exc:
+                logger.warning("HIM API unavailable (%s) - running in cache-only mode", exc)
+                self._him_available = False
+
         if self._persist_task is None:
             self._persist_task = asyncio.create_task(self._persistence_loop())
             logger.info(
@@ -145,7 +133,7 @@ class HormoneStateManager:
             )
 
     async def stop(self) -> None:
-        """Stop background task and flush all dirty entries."""
+        """Stop background task, flush all dirty entries, and close HTTP client."""
         if self._persist_task:
             self._persist_task.cancel()
             try:
@@ -155,6 +143,12 @@ class HormoneStateManager:
 
         # Final flush
         await self._flush_all_dirty()
+
+        # Close HTTP client
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
         logger.info("HormoneStateManager stopped")
 
     @property
@@ -164,7 +158,7 @@ class HormoneStateManager:
 
     async def get_state(self, channel_id: str) -> CachedHormoneState:
         """
-        Retrieve hormone state for a channel (from cache or HIM).
+        Retrieve hormone state for a channel (from cache or HIM API).
 
         Returns default state if channel has no history.
 
@@ -178,8 +172,8 @@ class HormoneStateManager:
             if channel_id in self._cache:
                 return self._cache[channel_id]
 
-            # Not in cache: try loading from HIM
-            state = await self._load_from_him(channel_id)
+            # Not in cache: try loading from HIM API
+            state = await self._load_from_api(channel_id)
             self._cache[channel_id] = state
             return state
 
@@ -252,7 +246,7 @@ class HormoneStateManager:
                 self._failed_flushes += 1
 
     async def _flush_all_dirty(self) -> None:
-        """Write all dirty cache entries to HIM."""
+        """Write all dirty cache entries to HIM API."""
         dirty_entries: list[tuple[str, CachedHormoneState]] = []
 
         async with self._cache_lock:
@@ -263,16 +257,16 @@ class HormoneStateManager:
         if not dirty_entries:
             return
 
-        # Write to HIM (synchronous, outside lock)
+        # Write to HIM API
         success_count = 0
         for channel_id, state in dirty_entries:
-            # Skip if HIM is unavailable (state remains dirty)
-            if self.store is None or not self._him_available:
+            # Skip if HIM API is unavailable (state remains dirty)
+            if self._http_client is None or not self._him_available:
                 self._failed_flushes += 1
                 continue
 
             try:
-                await self._write_to_him(channel_id, state)
+                await self._write_to_api(channel_id, state)
                 # Clear dirty flag after successful write
                 async with self._cache_lock:
                     if channel_id in self._cache:
@@ -288,234 +282,85 @@ class HormoneStateManager:
         if success_count > 0:
             self._last_flush_time = dt.datetime.now(dt.timezone.utc)
             self._total_flushes += 1
-            logger.debug("Flushed %d/%d dirty hormone states to HIM", success_count, len(dirty_entries))
+            logger.debug("Flushed %d/%d dirty hormone states to HIM API", success_count, len(dirty_entries))
 
-    async def _load_from_him(self, channel_id: str) -> CachedHormoneState:
-        """Load latest hormone state from HIM, or return default."""
-        if not self._him_available or self.store is None:
-            logger.debug("HIM unavailable, using default state for channel %s", channel_id)
+    async def _load_from_api(self, channel_id: str) -> CachedHormoneState:
+        """Load latest hormone state from HIM API, or return default."""
+        if not self._him_available or self._http_client is None:
+            logger.debug("HIM API unavailable, using default state for channel %s", channel_id)
             return self._default_state()
 
-        snapshot_id = str(channel_id)
-
         try:
-            # Check if snapshot exists
-            if not self.store.snapshot_exists(snapshot_id):
+            response = await self._http_client.get(f"/v1/hormones/{channel_id}")
+
+            if response.status_code == 404:
                 return self._default_state()
 
-            # Find latest tile at level 0 (finest resolution)
-            metas = self.store.tiles_for_snapshot(
-                snapshot_id,
-                stream=self.stream,
-                level_range=(0, 0),  # Only level 0
+            if response.status_code != 200:
+                logger.warning("HIM API returned status %d for channel %s", response.status_code, channel_id)
+                return self._default_state()
+
+            data = response.json()
+
+            # Parse API response into CachedHormoneState
+            hormones = data.get("hormones", {})
+            if not hormones:
+                return self._default_state()
+
+            vector = HormoneVector.from_dict(hormones)
+
+            last_response_ts = None
+            if data.get("last_response_ts"):
+                try:
+                    last_response_ts = dt.datetime.fromisoformat(data["last_response_ts"])
+                except ValueError:
+                    pass
+
+            last_updated = dt.datetime.now(dt.timezone.utc)
+            if data.get("last_updated"):
+                try:
+                    last_updated = dt.datetime.fromisoformat(data["last_updated"])
+                except ValueError:
+                    pass
+
+            return CachedHormoneState(
+                vector=vector,
+                focus_topic=data.get("focus_topic"),
+                energy_level=data.get("energy_level", 0.5),
+                messages_since_response=data.get("messages_since_response", 0),
+                last_response_ts=last_response_ts,
+                last_updated=last_updated,
+                dirty=False,
             )
 
-            if not metas:
-                return self._default_state()
-
-            # Sort by x coordinate (time bucket) descending to get latest
-            metas_sorted = sorted(metas, key=lambda m: m.x, reverse=True)
-            latest_meta = metas_sorted[0]
-
-            # Load tile payload
-            stored = self.store.get_tile(latest_meta.tile_id)
-            payload_data = json.loads(stored.payload_path.read_bytes().decode("utf-8"))
-
-            # Parse into CachedHormoneState
-            return self._payload_to_state(payload_data)
-
         except Exception as exc:
-            logger.warning("Failed to load hormone state from HIM for channel %s: %s", channel_id, exc)
+            logger.warning("Failed to load hormone state from HIM API for channel %s: %s", channel_id, exc)
             self._him_available = False
             return self._default_state()
 
-    async def _write_to_him(self, channel_id: str, state: CachedHormoneState) -> None:
-        """Write hormone state to HIM as tiles."""
-        if self.store is None:
-            return  # Skip if HIM is unavailable
+    async def _write_to_api(self, channel_id: str, state: CachedHormoneState) -> None:
+        """Write hormone state to HIM API."""
+        if self._http_client is None:
+            return  # Skip if HTTP client is unavailable
 
-        snapshot_id = str(channel_id)
-        timestamp = state.last_updated
-
-        # Ensure snapshot exists
-        self._ensure_snapshot(snapshot_id)
-
-        # Generate payload
-        payload_bytes = self._state_to_payload_bytes(channel_id, state, timestamp)
-
-        # Build tile records for all levels
-        records = self._build_tile_records(snapshot_id, timestamp, payload_bytes)
-
-        # Write to HIM
-        metas = self.store.put_tiles(records)
-        logger.debug(
-            "Wrote %d HIM tiles for channel=%s levels=%s",
-            len(metas),
-            channel_id,
-            [m.level for m in metas],
-        )
-
-    def _state_to_payload_bytes(
-        self,
-        channel_id: str,
-        state: CachedHormoneState,
-        timestamp: dt.datetime,
-    ) -> bytes:
-        """Serialize hormone state to JSON payload bytes."""
-        time_bucket = int(timestamp.timestamp()) // self.snapshot_interval
-
-        # Extract hormone values using to_dict() method
-        hormones = state.vector.to_dict()
-
-        # Generate visual shapes for HIM compatibility
-        shapes = self._generate_shapes(hormones)
-
-        payload = {
-            "format": "hormonal_state_v1",
-            "channel_id": channel_id,
-            "timestamp": timestamp.isoformat(),
-            "time_bucket": time_bucket,
-            "hormones": hormones,
-            "metadata": {
-                "focus_topic": state.focus_topic,
-                "energy_level": state.energy_level,
-                "messages_since_response": state.messages_since_response,
-                "last_response_ts": state.last_response_ts.isoformat() if state.last_response_ts else None,
-            },
-            "shapes": shapes,
+        # Build update payload
+        update_data = {
+            "hormones": state.vector.to_dict(),
+            "focus_topic": state.focus_topic,
+            "energy_level": state.energy_level,
+            "messages_since_response": state.messages_since_response,
+            "last_response_ts": state.last_response_ts.isoformat() if state.last_response_ts else None,
         }
 
-        return json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-
-    def _payload_to_state(self, payload: dict) -> CachedHormoneState:
-        """Deserialize JSON payload to CachedHormoneState."""
-        hormones = payload.get("hormones", {})
-        metadata = payload.get("metadata", {})
-
-        # Use from_dict() method to reconstruct hormone vector
-        vector = HormoneVector.from_dict(hormones)
-
-        last_response_ts = None
-        if metadata.get("last_response_ts"):
-            try:
-                last_response_ts = dt.datetime.fromisoformat(metadata["last_response_ts"])
-            except ValueError:
-                pass
-
-        timestamp_str = payload.get("timestamp")
-        last_updated = dt.datetime.now(dt.timezone.utc)
-        if timestamp_str:
-            try:
-                last_updated = dt.datetime.fromisoformat(timestamp_str)
-            except ValueError:
-                pass
-
-        return CachedHormoneState(
-            vector=vector,
-            focus_topic=metadata.get("focus_topic"),
-            energy_level=metadata.get("energy_level", 0.5),
-            messages_since_response=metadata.get("messages_since_response", 0),
-            last_response_ts=last_response_ts,
-            last_updated=last_updated,
-            dirty=False,  # Just loaded, not dirty
+        response = await self._http_client.put(
+            f"/v1/hormones/{channel_id}",
+            json=update_data,
         )
 
-    def _build_tile_records(
-        self,
-        snapshot_id: str,
-        timestamp: dt.datetime,
-        payload_bytes: bytes,
-    ) -> list:
-        """Build tile records for all pyramid levels."""
-        # Lazy import to avoid circular dependencies
-        from him.models import TileIngestRecord, TilePayload
+        if response.status_code not in (200, 201):
+            raise Exception(f"HIM API returned status {response.status_code}: {response.text}")
 
-        encoded_payload = base64.b64encode(payload_bytes).decode("utf-8")
-        records: list = []
-        parent_tile_id = None
-
-        for level in range(0, self.max_level + 1):
-            x, y = self._time_bucket_to_coords(timestamp, level)
-            tile_id = self._compute_tile_id(self.stream, snapshot_id, level, x, y, payload_bytes)
-
-            record = TileIngestRecord(
-                stream=self.stream,
-                snapshot_id=snapshot_id,
-                level=level,
-                x=x,
-                y=y,
-                shape=(1, 1, 1),
-                dtype=HORMONE_DTYPE,
-                payload=TilePayload(bytes_b64=encoded_payload),
-                halo=None,
-                parent_tile_id=parent_tile_id,
-            )
-            records.append(record)
-            parent_tile_id = tile_id
-
-        return records
-
-    def _time_bucket_to_coords(self, timestamp: dt.datetime, level: int) -> tuple[int, int]:
-        """
-        Map timestamp to tile coordinates for hierarchical storage.
-
-        Level 0 (finest): 5-minute buckets
-        Level 1: 1-hour buckets (12x aggregation)
-        Level 2: 1-day buckets (288x aggregation)
-        Level 3: 1-week buckets (2016x aggregation)
-
-        x = time bucket index (continuous timeline)
-        y = 0 (single row, all temporal data on x-axis)
-        """
-        epoch = int(timestamp.timestamp())
-
-        if level == 0:
-            bucket = epoch // 300  # 5 minutes
-        elif level == 1:
-            bucket = epoch // 3600  # 1 hour
-        elif level == 2:
-            bucket = epoch // 86400  # 1 day
-        else:
-            bucket = epoch // 604800  # 1 week
-
-        x = bucket % (2**31)  # Prevent overflow
-        y = 0  # Single row per channel
-        return x, y
-
-    def _compute_tile_id(
-        self,
-        stream: str,
-        snapshot_id: str,
-        level: int,
-        x: int,
-        y: int,
-        payload_bytes: bytes,
-    ) -> str:
-        """Compute content-addressed tile ID using blake3."""
-        digest = blake3()
-        for part in (stream, snapshot_id, str(level), str(x), str(y)):
-            digest.update(part.encode("utf-8"))
-        digest.update(payload_bytes)
-        return digest.hexdigest()
-
-    def _ensure_snapshot(self, snapshot_id: str) -> None:
-        """Ensure HIM snapshot exists for channel."""
-        if self.store is None:
-            return  # Skip if HIM is unavailable
-        if self.store.snapshot_exists(snapshot_id):
-            return
-
-        # Lazy import to avoid circular dependencies
-        from him.models import SnapshotCreate
-
-        payload = SnapshotCreate(
-            snapshot_id=snapshot_id,
-            parents=[],
-            tags={"channel_id": snapshot_id, "type": "hormonal_state"},
-            provenance=self._provenance,
-        )
-        self.store.create_snapshot(payload)
-        logger.info("Created HIM snapshot for hormone state: channel=%s", snapshot_id)
+        logger.debug("Wrote hormone state to HIM API for channel=%s", channel_id)
 
     @staticmethod
     def _default_state() -> CachedHormoneState:
@@ -529,38 +374,9 @@ class HormoneStateManager:
             dirty=False,
         )
 
-    @staticmethod
-    def _generate_shapes(hormones: dict) -> list[dict]:
-        """Generate visual shapes for HIM tile visualization."""
-        shapes = []
-        hormone_list = list(hormones.items())
-
-        for idx, (name, value) in enumerate(hormone_list):
-            # Map hormone to circle on unit canvas
-            angle = (idx / max(1, len(hormone_list))) * 2 * math.pi
-            radius = max(0.05, min(0.15, abs(value) * 0.4))
-            cx = 0.5 + math.cos(angle) * 0.35 * value
-            cy = 0.5 + math.sin(angle) * 0.35 * value
-
-            # Color based on value
-            intensity = max(0.0, min(1.0, (value + 1.0) / 2.0))
-            color = f"#{int(255 * intensity):02x}{int(180 * (1 - intensity)):02x}{int(200 * abs(value)):02x}"
-
-            shapes.append({
-                "kind": "circle",
-                "center": [cx, cy],
-                "radius": radius,
-                "stroke": color,
-                "fill": color,
-                "hormone": name,
-                "value": value,
-            })
-
-        return shapes
-
     @property
     def him_available(self) -> bool:
-        """Check if HIM backend is available."""
+        """Check if HIM API is available."""
         return self._him_available
 
     def get_metrics(self) -> dict:
@@ -575,6 +391,7 @@ class HormoneStateManager:
             "cache_size": len(self._cache),
             "dirty_count": dirty_count,
             "him_available": self._him_available,
+            "api_base_url": self._api_base_url,
             "last_flush_time": self._last_flush_time.isoformat() if self._last_flush_time else None,
             "total_flushes": self._total_flushes,
             "failed_flushes": self._failed_flushes,
@@ -582,27 +399,28 @@ class HormoneStateManager:
 
 
 class HormoneHistoryQuery:
-    """Query historical hormone data from HIM for analysis."""
+    """Query historical hormone data from HIM API for analysis."""
 
-    def __init__(self, store) -> None:
+    def __init__(self, api_base_url: str = "http://localhost:8000") -> None:
         """
         Initialize history query helper.
 
         Args:
-            store: HierarchicalImageMemory instance
+            api_base_url: Base URL for HIM API
         """
-        self.store = store
+        self._api_base_url = api_base_url.rstrip("/")
         self.stream = HORMONE_STREAM
 
-    def query_range(
+    async def query_range(
         self,
         channel_id: str,
         start_time: dt.datetime,
         end_time: dt.datetime,
         level: int = 0,
+        limit: int = 100,
     ) -> list[dict]:
         """
-        Query hormone snapshots in a time range.
+        Query hormone snapshots in a time range via HIM API.
 
         Returns list of payload dicts sorted by timestamp.
 
@@ -611,13 +429,14 @@ class HormoneHistoryQuery:
             start_time: Start of time range (inclusive)
             end_time: End of time range (inclusive)
             level: Pyramid level (0=5min, 1=hourly, 2=daily, 3=weekly)
+            limit: Maximum number of results
 
         Returns:
             List of hormone payload dicts sorted by timestamp
 
         Example:
-            query = HormoneHistoryQuery(him_store)
-            snapshots = query.query_range(
+            query = HormoneHistoryQuery("http://localhost:8000")
+            snapshots = await query.query_range(
                 "channel_123",
                 datetime(2025, 12, 1),
                 datetime(2025, 12, 10),
@@ -626,43 +445,31 @@ class HormoneHistoryQuery:
             for snapshot in snapshots:
                 print(snapshot["timestamp"], snapshot["hormones"]["dopamine"])
         """
-        snapshot_id = str(channel_id)
-
-        if not self.store.snapshot_exists(snapshot_id):
-            return []
-
-        # Calculate time bucket range using HormoneStateManager logic
-        manager = HormoneStateManager(store=self.store)
-        x_start, _ = manager._time_bucket_to_coords(start_time, level)
-        x_end, _ = manager._time_bucket_to_coords(end_time, level)
-
-        # Query tiles in range
-        metas = self.store.tiles_for_snapshot(
-            snapshot_id,
-            stream=self.stream,
-            level_range=(level, level),
-        )
-
-        # Filter by x coordinate (time bucket)
-        filtered = [m for m in metas if x_start <= m.x <= x_end]
-
-        # Load payloads
-        results = []
-        for meta in filtered:
+        async with httpx.AsyncClient(base_url=self._api_base_url) as client:
             try:
-                stored = self.store.get_tile(meta.tile_id)
-                payload = json.loads(stored.payload_path.read_bytes().decode("utf-8"))
-                results.append(payload)
+                response = await client.get(
+                    f"/v1/hormones/{channel_id}/history",
+                    params={
+                        "start": start_time.isoformat(),
+                        "end": end_time.isoformat(),
+                        "level": level,
+                        "limit": limit,
+                    },
+                )
+
+                if response.status_code != 200:
+                    logger.warning("HIM API returned status %d", response.status_code)
+                    return []
+
+                return response.json()
+
             except Exception as exc:
-                logger.warning("Failed to load tile %s: %s", meta.tile_id, exc)
+                logger.warning("Failed to query hormone history: %s", exc)
+                return []
 
-        # Sort by timestamp
-        results.sort(key=lambda p: p.get("timestamp", ""))
-        return results
-
-    def get_latest(self, channel_id: str) -> Optional[dict]:
+    async def get_latest(self, channel_id: str) -> Optional[dict]:
         """
-        Get most recent hormone snapshot.
+        Get most recent hormone snapshot via HIM API.
 
         Args:
             channel_id: Discord channel ID
@@ -670,26 +477,19 @@ class HormoneHistoryQuery:
         Returns:
             Latest hormone payload dict or None if no history
         """
-        snapshot_id = str(channel_id)
+        async with httpx.AsyncClient(base_url=self._api_base_url) as client:
+            try:
+                response = await client.get(f"/v1/hormones/{channel_id}")
 
-        if not self.store.snapshot_exists(snapshot_id):
-            return None
+                if response.status_code != 200:
+                    return None
 
-        metas = self.store.tiles_for_snapshot(
-            snapshot_id,
-            stream=self.stream,
-            level_range=(0, 0),
-        )
+                data = response.json()
+                if not data.get("hormones"):
+                    return None
 
-        if not metas:
-            return None
+                return data
 
-        # Latest by x coordinate (time bucket)
-        latest = max(metas, key=lambda m: m.x)
-
-        try:
-            stored = self.store.get_tile(latest.tile_id)
-            return json.loads(stored.payload_path.read_bytes().decode("utf-8"))
-        except Exception as exc:
-            logger.warning("Failed to load latest tile: %s", exc)
-            return None
+            except Exception as exc:
+                logger.warning("Failed to get latest hormone state: %s", exc)
+                return None

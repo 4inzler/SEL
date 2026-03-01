@@ -172,14 +172,21 @@ class ConfidenceScorer:
         Returns:
             Statistics dict
         """
-        if not self._confidence_history:
+        scores = [h["score"] for h in self._confidence_history]
+        return self.summarize_scores(scores)
+
+    @staticmethod
+    def summarize_scores(scores: List[int]) -> Dict:
+        """
+        Summarize a list of confidence scores into statistics.
+        """
+        if not scores:
             return {
                 "total_responses": 0,
                 "average_confidence": 0,
                 "confidence_trend": "unknown"
             }
 
-        scores = [h["score"] for h in self._confidence_history]
         avg = sum(scores) / len(scores)
 
         # Trend: compare recent vs older
@@ -196,7 +203,7 @@ class ConfidenceScorer:
             trend = "insufficient_data"
 
         return {
-            "total_responses": len(self._confidence_history),
+            "total_responses": len(scores),
             "average_confidence": round(avg, 1),
             "confidence_trend": trend,
             "recent_scores": scores[-5:]

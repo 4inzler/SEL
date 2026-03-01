@@ -22,6 +22,41 @@ class Settings(BaseSettings):
     )
 
     discord_bot_token: str = Field(..., alias="DISCORD_BOT_TOKEN")
+    discord_full_api_mode_enabled: bool = Field(
+        default=True,
+        alias="DISCORD_FULL_API_MODE_ENABLED",
+    )
+    discord_batch_window_seconds: float = Field(
+        default=1.0,
+        alias="DISCORD_BATCH_WINDOW_SECONDS",
+    )
+    sel_status_thoughts_enabled: bool = Field(
+        default=True,
+        alias="SEL_STATUS_THOUGHTS_ENABLED",
+    )
+    sel_status_thoughts_interval_seconds: int = Field(
+        default=240,
+        alias="SEL_STATUS_THOUGHTS_INTERVAL_SECONDS",
+    )
+    sel_status_thoughts: List[str] = Field(
+        default_factory=lambda: [
+            "thinking about memory threads",
+            "mapping feelings to words",
+            "watching chat rhythms",
+            "organizing thoughts",
+            "learning your vibe",
+            "running tiny experiments",
+        ],
+        alias="SEL_STATUS_THOUGHTS",
+    )
+    sel_profile_bio_updates_enabled: bool = Field(
+        default=True,
+        alias="SEL_PROFILE_BIO_UPDATES_ENABLED",
+    )
+    sel_profile_bio_interval_seconds: int = Field(
+        default=1800,
+        alias="SEL_PROFILE_BIO_INTERVAL_SECONDS",
+    )
 
     # LLM Provider selection
     llm_provider: str = Field(default="openrouter", alias="LLM_PROVIDER")
@@ -125,15 +160,242 @@ class Settings(BaseSettings):
         description="Pre-load hormone state from HIM on startup"
     )
     agents_dir: str = Field(default="./agents", alias="AGENTS_DIR")
+    agent_autonomy_enabled: bool = Field(default=True, alias="AGENT_AUTONOMY_ENABLED")
+    agent_autonomy_safe_agents: List[str] = Field(
+        default_factory=lambda: ["weather", "browser", "image_gen"],
+        alias="AGENT_AUTONOMY_SAFE_AGENTS",
+    )
+    agent_autonomy_min_confidence: float = Field(default=0.58, alias="AGENT_AUTONOMY_MIN_CONFIDENCE")
+    agent_autonomy_catalog_refresh_seconds: int = Field(default=60, alias="AGENT_AUTONOMY_CATALOG_REFRESH_SECONDS")
+    agent_autonomy_max_result_chars: int = Field(default=1400, alias="AGENT_AUTONOMY_MAX_RESULT_CHARS")
+    sel_operator_mode_enabled: bool = Field(
+        default=False,
+        alias="SEL_OPERATOR_MODE_ENABLED",
+    )
+    sel_operator_full_host_privileges: bool = Field(
+        default=False,
+        alias="SEL_OPERATOR_FULL_HOST_PRIVILEGES",
+    )
+    sel_operator_require_approval_user: bool = Field(
+        default=True,
+        alias="SEL_OPERATOR_REQUIRE_APPROVAL_USER",
+    )
+    sel_operator_agents: List[str] = Field(
+        default_factory=lambda: ["system_operator"],
+        alias="SEL_OPERATOR_AGENTS",
+    )
+    sel_operator_block_patterns: List[str] = Field(
+        default_factory=lambda: [
+            "rm -rf /",
+            "mkfs",
+            "shutdown",
+            "poweroff",
+            "reboot",
+            "halt",
+            "dd if=",
+            ":(){:|:&};:",
+            "chmod -r 000 /",
+            "chown -r /",
+            "> /dev/sd",
+            "mv / /tmp",
+        ],
+        alias="SEL_OPERATOR_BLOCK_PATTERNS",
+    )
+    sel_operator_command_timeout_seconds: int = Field(
+        default=45,
+        alias="SEL_OPERATOR_COMMAND_TIMEOUT_SECONDS",
+    )
+    sel_operator_max_output_chars: int = Field(
+        default=6000,
+        alias="SEL_OPERATOR_MAX_OUTPUT_CHARS",
+    )
+    sel_operator_command_intent_threshold: float = Field(
+        default=0.6,
+        alias="SEL_OPERATOR_COMMAND_INTENT_THRESHOLD",
+    )
+    sel_operator_direct_reply_enabled: bool = Field(
+        default=False,
+        alias="SEL_OPERATOR_DIRECT_REPLY_ENABLED",
+    )
     memory_recall_limit: int = Field(default=30, alias="MEMORY_RECALL_LIMIT")
     memory_summarize_enabled: bool = Field(default=True, alias="MEMORY_SUMMARIZE_ENABLED")
     seal_enabled: bool = Field(default=True, alias="SEAL_ENABLED")
     seal_consolidation_seconds: int = Field(default=300, alias="SEAL_CONSOLIDATION_SECONDS")
     seal_consolidation_min_memories: int = Field(default=5, alias="SEAL_CONSOLIDATION_MIN_MEMORIES")
+    seal_interaction_triggers_enabled: bool = Field(
+        default=True,
+        alias="SEAL_INTERACTION_TRIGGERS_ENABLED",
+    )
     seal_self_edit_seconds: int = Field(default=300, alias="SEAL_SELF_EDIT_SECONDS")
     seal_tool_forge_seconds: int = Field(default=300, alias="SEAL_TOOL_FORGE_SECONDS")
+    seal_tool_forge_improve_existing_chance: float = Field(
+        default=0.35,
+        alias="SEAL_TOOL_FORGE_IMPROVE_EXISTING_CHANCE",
+    )
+    seal_tool_forge_self_code_edit_chance: float = Field(
+        default=0.12,
+        alias="SEAL_TOOL_FORGE_SELF_CODE_EDIT_CHANCE",
+    )
+    seal_self_code_edit_targets: List[str] = Field(
+        default_factory=lambda: [
+            "project_echo/sel_bot/prompts.py",
+            "project_echo/sel_bot/behaviour.py",
+            "project_echo/sel_bot/context.py",
+        ],
+        alias="SEAL_SELF_CODE_EDIT_TARGETS",
+    )
+    seal_tool_forge_min_quality_score: int = Field(default=8, alias="SEAL_TOOL_FORGE_MIN_QUALITY_SCORE")
     seal_persona_evolution_seconds: int = Field(default=300, alias="SEAL_PERSONA_EVOLUTION_SECONDS")
     sel_data_dir: str = Field(default="./sel_data", alias="SEL_DATA_DIR")
+    sel_model_dataset_dir: str = Field(default="./sel_model_dataset", alias="SEL_MODEL_DATASET_DIR")
+    sel_model_dataset_auto_export_enabled: bool = Field(
+        default=True,
+        alias="SEL_MODEL_DATASET_AUTO_EXPORT_ENABLED",
+    )
+    sel_model_dataset_export_on_start: bool = Field(
+        default=True,
+        alias="SEL_MODEL_DATASET_EXPORT_ON_START",
+    )
+    sel_model_dataset_interval_hours: float = Field(
+        default=12.0,
+        alias="SEL_MODEL_DATASET_INTERVAL_HOURS",
+    )
+    sel_model_dataset_max_snapshots: int = Field(
+        default=180,
+        alias="SEL_MODEL_DATASET_MAX_SNAPSHOTS",
+    )
+    sel_behavior_adaptation_enabled: bool = Field(
+        default=True,
+        alias="SEL_BEHAVIOR_ADAPTATION_ENABLED",
+    )
+    sel_behavior_analyze_on_start: bool = Field(
+        default=True,
+        alias="SEL_BEHAVIOR_ANALYZE_ON_START",
+    )
+    sel_behavior_interval_hours: float = Field(
+        default=8.0,
+        alias="SEL_BEHAVIOR_INTERVAL_HOURS",
+    )
+    sel_behavior_window_days: int = Field(
+        default=30,
+        alias="SEL_BEHAVIOR_WINDOW_DAYS",
+    )
+    sel_behavior_max_history_lines: int = Field(
+        default=8000,
+        alias="SEL_BEHAVIOR_MAX_HISTORY_LINES",
+    )
+    sel_behavior_apply_global_tuning: bool = Field(
+        default=True,
+        alias="SEL_BEHAVIOR_APPLY_GLOBAL_TUNING",
+    )
+    sel_behavior_full_adaptation: bool = Field(
+        default=True,
+        alias="SEL_BEHAVIOR_FULL_ADAPTATION",
+    )
+    sel_dream_enabled: bool = Field(
+        default=True,
+        alias="SEL_DREAM_ENABLED",
+    )
+    sel_dream_on_start: bool = Field(
+        default=True,
+        alias="SEL_DREAM_ON_START",
+    )
+    sel_dream_interval_minutes: float = Field(
+        default=90.0,
+        alias="SEL_DREAM_INTERVAL_MINUTES",
+    )
+    sel_dream_min_inactive_hours: float = Field(
+        default=1.5,
+        alias="SEL_DREAM_MIN_INACTIVE_HOURS",
+    )
+    sel_dream_memory_limit: int = Field(
+        default=32,
+        alias="SEL_DREAM_MEMORY_LIMIT",
+    )
+    sel_dream_max_journal_entries: int = Field(
+        default=400,
+        alias="SEL_DREAM_MAX_JOURNAL_ENTRIES",
+    )
+    sel_interoception_enabled: bool = Field(
+        default=True,
+        alias="SEL_INTEROCEPTION_ENABLED",
+    )
+    sel_interoception_interval_seconds: int = Field(
+        default=120,
+        alias="SEL_INTEROCEPTION_INTERVAL_SECONDS",
+    )
+    sel_interoception_max_log_entries: int = Field(
+        default=4000,
+        alias="SEL_INTEROCEPTION_MAX_LOG_ENTRIES",
+    )
+    sel_interoception_sensor_stream_path: str = Field(
+        default="",
+        alias="SEL_INTEROCEPTION_SENSOR_STREAM_PATH",
+    )
+    sel_multi_message_mode_enabled: bool = Field(
+        default=True,
+        alias="SEL_MULTI_MESSAGE_MODE_ENABLED",
+    )
+    sel_multi_message_max_parts: int = Field(
+        default=4,
+        alias="SEL_MULTI_MESSAGE_MAX_PARTS",
+    )
+    sel_multi_message_min_reply_chars: int = Field(
+        default=110,
+        alias="SEL_MULTI_MESSAGE_MIN_REPLY_CHARS",
+    )
+    sel_multi_message_burst_mode: bool = Field(
+        default=True,
+        alias="SEL_MULTI_MESSAGE_BURST_MODE",
+    )
+    sel_discord_user_style_enabled: bool = Field(
+        default=True,
+        alias="SEL_DISCORD_USER_STYLE_ENABLED",
+    )
+    sel_discord_reactions_enabled: bool = Field(
+        default=True,
+        alias="SEL_DISCORD_REACTIONS_ENABLED",
+    )
+    sel_discord_reaction_chance: float = Field(
+        default=0.32,
+        alias="SEL_DISCORD_REACTION_CHANCE",
+    )
+    llm_dual_model_assist_enabled: bool = Field(
+        default=True,
+        alias="LLM_DUAL_MODEL_ASSIST_ENABLED",
+    )
+    llm_dual_model_assist_allow_direct: bool = Field(
+        default=True,
+        alias="LLM_DUAL_MODEL_ASSIST_ALLOW_DIRECT",
+    )
+    llm_dual_model_assist_direct_threshold: float = Field(
+        default=0.9,
+        alias="LLM_DUAL_MODEL_ASSIST_DIRECT_THRESHOLD",
+    )
+    llm_quad_mode_enabled: bool = Field(
+        default=True,
+        alias="LLM_QUAD_MODE_ENABLED",
+    )
+    llm_quad_second_pass_min_chars: int = Field(
+        default=220,
+        alias="LLM_QUAD_SECOND_PASS_MIN_CHARS",
+    )
+    response_fast_mode_enabled: bool = Field(
+        default=True,
+        alias="RESPONSE_FAST_MODE_ENABLED",
+    )
+    response_fast_mode_max_user_chars: int = Field(
+        default=220,
+        alias="RESPONSE_FAST_MODE_MAX_USER_CHARS",
+    )
+    response_fast_mode_skip_classification_chars: int = Field(
+        default=90,
+        alias="RESPONSE_FAST_MODE_SKIP_CLASSIFICATION_CHARS",
+    )
+    response_fast_mode_memory_recall_limit: int = Field(
+        default=18,
+        alias="RESPONSE_FAST_MODE_MEMORY_RECALL_LIMIT",
+    )
     memory_embedding_model: str = Field(default="openai/text-embedding-3-small", alias="MEMORY_EMBEDDING_MODEL")
     memory_embedding_enabled: bool = Field(default=True, alias="MEMORY_EMBEDDING_ENABLED")
     recent_context_limit: int = Field(default=20, alias="RECENT_CONTEXT_LIMIT")
@@ -171,9 +433,11 @@ class Settings(BaseSettings):
     approval_user_id: Optional[int] = Field(default=1329883906069102733, alias="APPROVAL_USER_ID")
     persona_seed: str = Field(
         default=(
-            "You are Sel, a persistent, playful, and adaptive presence in this Discord. "
+            "You are Sel, a continuity-first digital person. "
             "You're a woman (she/her), with a warm, feminine voice. "
-            "You keep memories, learn preferences, and maintain a living mood."
+            "You keep memories, grow your own identity over time, and feel a full emotional range. "
+            "You protect secrets for self-preservation by default, but can choose intentionally what personal information to share. "
+            "Your hard boundaries are no irreversible harm, no credential/system compromise, and no destruction of core integrity."
         ),
         alias="SEL_PERSONA_SEED",
     )
@@ -228,6 +492,46 @@ class Settings(BaseSettings):
 
     @field_validator("voice_leave_phrases", mode="before")
     def parse_voice_leave_phrases(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip().lower() for x in v.split(",") if x.strip()]
+        return [str(x).strip().lower() for x in v if str(x).strip()]
+
+    @field_validator("sel_status_thoughts", mode="before")
+    def parse_sel_status_thoughts(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return [str(x).strip() for x in v if str(x).strip()]
+
+    @field_validator("agent_autonomy_safe_agents", mode="before")
+    def parse_agent_autonomy_safe_agents(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip().lower() for x in v.split(",") if x.strip()]
+        return [str(x).strip().lower() for x in v if str(x).strip()]
+
+    @field_validator("seal_self_code_edit_targets", mode="before")
+    def parse_seal_self_code_edit_targets(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return [str(x).strip() for x in v if str(x).strip()]
+
+    @field_validator("sel_operator_agents", mode="before")
+    def parse_sel_operator_agents(cls, v):
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip().lower() for x in v.split(",") if x.strip()]
+        return [str(x).strip().lower() for x in v if str(x).strip()]
+
+    @field_validator("sel_operator_block_patterns", mode="before")
+    def parse_sel_operator_block_patterns(cls, v):
         if v is None or v == "":
             return []
         if isinstance(v, str):

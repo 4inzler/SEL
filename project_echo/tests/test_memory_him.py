@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from sel_bot.memory import MemoryManager
@@ -23,3 +25,34 @@ async def test_him_memory_store_and_recall(tmp_path) -> None:
     tiles = manager.store.tiles_for_snapshot("chan-1", stream=manager.stream, level_range=(2, 0))
     assert len(tiles) >= 2
     assert all(tile.dtype.startswith("vector/json") for tile in tiles)
+
+
+@pytest.mark.asyncio
+async def test_him_memory_retrieve_recent(tmp_path) -> None:
+    manager = MemoryManager(
+        state_manager=None,
+        him_root=tmp_path,
+        max_level=2,
+    )
+
+    older = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+    newer = dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc)
+
+    await manager.maybe_store(
+        "chan-2",
+        "First memory stored",
+        tags=["chat"],
+        salience=0.4,
+        timestamp=older,
+    )
+    await manager.maybe_store(
+        "chan-2",
+        "Second memory stored",
+        tags=["chat"],
+        salience=0.6,
+        timestamp=newer,
+    )
+
+    recent = await manager.retrieve_recent("chan-2", limit=1)
+    assert recent
+    assert recent[0].summary == "Second memory stored"
