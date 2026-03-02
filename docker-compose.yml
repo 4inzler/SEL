@@ -134,6 +134,10 @@ services:
       # Python
       PYTHONUNBUFFERED: 1
 
+    # Allow Docker container to reach host machine (e.g. Ollama on host)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
     # Network isolation
     networks:
       - sel-network
