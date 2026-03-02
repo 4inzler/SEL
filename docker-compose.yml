@@ -8,6 +8,8 @@ services:
       dockerfile: Dockerfile
     container_name: sel-discord-bot
     restart: unless-stopped
+    env_file:
+      - .env
 
     # SECURITY: Run as non-root user
     user: "1000:1000"
